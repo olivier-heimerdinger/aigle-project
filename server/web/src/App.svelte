@@ -1,12 +1,14 @@
 <script>
   import { onMount } from 'svelte';
-  import { api, formatCurrency, ROLE_BADGES, setActiveWorkspaceId } from './lib/api.js';
+  import { api, formatCurrency, ROLE_BADGES, PROJECT_ROLE_PRESETS, setActiveWorkspaceId } from './lib/api.js';
   import GanttView from './lib/components/GanttView.svelte';
   import KanbanView from './lib/components/KanbanView.svelte';
   import FinanceView from './lib/components/FinanceView.svelte';
   import WikiView from './lib/components/WikiView.svelte';
   import AdminView from './lib/components/AdminView.svelte';
   import PublicPortalView from './lib/components/PublicPortalView.svelte';
+  import AccountModal from './lib/components/AccountModal.svelte';
+  import ProjectAccessView from './lib/components/ProjectAccessView.svelte';
 
   // Détermine si l'utilisateur consulte le Portail Public (/) ou l'Espace SaaS Protégé (/app)
   let viewMode = $state(
@@ -15,9 +17,17 @@
   let isAuthenticated = $state(false);
 
   let projects = $state([]);
+  let workspaceUsers = $state([]);
   let activeProjectId = $state('');
-  let activeTab = $state('gantt'); // 'portfolio' | 'gantt' | 'kanban' | 'finance' | 'wiki' | 'admin'
+  let activeTab = $state('gantt'); // 'portfolio' | 'gantt' | 'kanban' | 'finance' | 'wiki' | 'access' | 'admin'
   let kanbanWbsFilter = $state('');
+
+  let showAccountModal = $state(false);
+
+  // État de verrouillage 2FA TOTP par projet (si le projet exige un code 2FA TOTP)
+  let totpChallenge = $state(null); // { project_id, project_code, project_name, totp_enabled, error }
+  let totpChallengeCode = $state('');
+  let totpChallengeErr = $state('');
 
   // Contexte d'identité SSO Authelia & Multi-Tenant
   let authContext = $state({
@@ -34,10 +44,13 @@
     can_write: true,
     can_manage_project: true,
     is_admin: true,
+    totp_enabled: false,
+    totp_verified_session: false,
+    password_mode: 'both',
     auth_mode: 'authelia',
     app_domain: 'aigle.heimerdinger.studio',
-    auth_domain: 'airgle-auth.heimerdinger.studio',
-    logout_url: 'https://airgle-auth.heimerdinger.studio/logout',
+    auth_domain: 'aigle-auth.heimerdinger.studio',
+    logout_url: 'https://aigle-auth.heimerdinger.studio/logout',
   });
 
   let selectedWorkspaceId = $state('ws_default');
@@ -45,6 +58,8 @@
   // État complet du projet actif
   let projectData = $state({
     project: null,
+    my_permissions: {},
+    project_members: [],
     financials: {},
     wbs_nodes: [],
     dependencies: [],
@@ -56,6 +71,7 @@
 
   let systemInfo = $state({ mode: 'saas', db_driver: 'postgres', auth_mode: 'authelia' });
   let showNewProjectModal = $state(false);
+  let newProjErr = $state('');
   let newProj = $state({
     code: '',
     name: '',
@@ -66,7 +82,14 @@
     initial_budget: 35000,
     default_hourly_rate: 75,
     currency: 'EUR',
+    owner_user_id: '',
+    require_totp: false,
+    project_members: [],
   });
+
+  // Ligne temporaire d'ajout de membre dans la modale de création de projet
+  let draftMemberUserId = $state('');
+  let draftMemberRole = $state('contributor');
 
   async function loadIdentityAndWorkspaces() {
     try {
@@ -76,6 +99,9 @@
         selectedWorkspaceId = me.active_workspace.id;
         setActiveWorkspaceId(selectedWorkspaceId);
       }
+      try {
+        workspaceUsers = (await api.getWorkspaceUsers()) || [];
+      } catch {}
     } catch (err) {
       console.error('Erreur chargement identité SSO:', err);
     }
@@ -85,6 +111,7 @@
     selectedWorkspaceId = newWsId;
     setActiveWorkspaceId(newWsId);
     activeProjectId = '';
+    totpChallenge = null;
     await loadIdentityAndWorkspaces();
     await loadPortfolio();
   }
@@ -100,6 +127,8 @@
       activeProjectId = '';
       projectData = {
         project: null,
+        my_permissions: {},
+        project_members: [],
         financials: {},
         wbs_nodes: [],
         dependencies: [],
@@ -118,10 +147,37 @@
     if (!activeProjectId) return;
     try {
       const full = await api.getProjectFull(activeProjectId);
+      totpChallenge = null;
       projectData = full;
       const list = await api.getProjects();
       projects = list || [];
-    } catch {}
+    } catch (err) {
+      if (err.status === 428 || err.code === 'TOTP_REQUIRED') {
+        totpChallenge = err.data || {
+          project_id: activeProjectId,
+          project_name: 'Projet Protégé 2FA',
+          totp_enabled: authContext.totp_enabled,
+          error: err.message,
+        };
+        totpChallengeCode = '';
+        totpChallengeErr = '';
+      }
+    }
+  }
+
+  async function submitProjectTOTPChallenge(e) {
+    e.preventDefault();
+    if (!totpChallenge?.project_id) return;
+    totpChallengeErr = '';
+    try {
+      await api.verifyProjectTOTP(totpChallenge.project_id, totpChallengeCode);
+      totpChallenge = null;
+      totpChallengeCode = '';
+      await loadIdentityAndWorkspaces();
+      await loadActiveProject();
+    } catch (err) {
+      totpChallengeErr = err.message;
+    }
   }
 
   async function selectProject(id) {
@@ -138,17 +194,66 @@
     activeTab = 'kanban';
   }
 
+  function openNewProjectDialog() {
+    newProjErr = '';
+    newProj = {
+      code: `PRJ${projects.length + 1}`,
+      name: '',
+      client_name: '',
+      description: '',
+      start_date: new Date().toISOString().slice(0, 10),
+      target_end_date: '2027-01-31',
+      initial_budget: 30000,
+      default_hourly_rate: 75,
+      currency: 'EUR',
+      owner_user_id: authContext.user?.id || '',
+      require_totp: false,
+      project_members: [],
+    };
+    if (workspaceUsers.length > 0) {
+      draftMemberUserId = workspaceUsers[0].id;
+    }
+    draftMemberRole = 'contributor';
+    showNewProjectModal = true;
+  }
+
+  function addDraftProjectMember() {
+    if (!draftMemberUserId) return;
+    const usr = workspaceUsers.find((u) => u.id === draftMemberUserId);
+    if (!usr) return;
+    const preset = PROJECT_ROLE_PRESETS[draftMemberRole] || PROJECT_ROLE_PRESETS.contributor;
+    const filtered = newProj.project_members.filter((m) => m.user_id !== draftMemberUserId);
+    newProj.project_members = [
+      ...filtered,
+      {
+        user_id: usr.id,
+        user_email: usr.email,
+        user_name: usr.display_name || usr.username,
+        project_role: draftMemberRole,
+        ...preset.perms,
+      },
+    ];
+  }
+
+  function removeDraftProjectMember(userId) {
+    newProj.project_members = newProj.project_members.filter((m) => m.user_id !== userId);
+  }
+
   async function createNewProject(e) {
     e.preventDefault();
-    const created = await api.createProject(newProj);
-    showNewProjectModal = false;
-    activeTab = 'gantt';
-    await loadPortfolio(created.id);
+    newProjErr = '';
+    try {
+      const created = await api.createProject(newProj);
+      showNewProjectModal = false;
+      activeTab = 'gantt';
+      await loadPortfolio(created.id);
+    } catch (err) {
+      newProjErr = err.message;
+    }
   }
 
   async function enterSaaSWorkspace() {
     if (typeof window !== 'undefined' && !window.location.pathname.startsWith('/app')) {
-      // Redirige vers /app afin que Traefik + Authelia déclenchent l'authentification ForwardAuth
       window.location.href = '/app';
       return;
     }
@@ -166,20 +271,17 @@
       systemInfo = await api.getHealth();
     } catch {}
 
-    // Si on est sur /app, on charge immédiatement l'environnement SaaS protégé
     if (viewMode === 'saas') {
       await loadIdentityAndWorkspaces();
       isAuthenticated = true;
       await loadPortfolio();
 
-      // Synchronisation temps réel SSE par Workspace
       const evtSource = new EventSource('/api/events');
       evtSource.onmessage = () => {
         loadActiveProject();
       };
       return () => evtSource.close();
     } else {
-      // Sur la page publique (/), on teste silencieusement si une session SSO est déjà ouverte
       try {
         const me = await api.getMe();
         if (me?.user?.email) {
@@ -190,7 +292,6 @@
     }
   });
 
-  // Totaux consolidés du portefeuille du Workspace actif
   let portfolioTotals = $derived.by(() => {
     let budget = 0,
       consumed = 0,
@@ -213,7 +314,7 @@
   <PublicPortalView onEnterSaaS={enterSaaSWorkspace} {isAuthenticated} />
 {:else}
 <div class="min-h-screen flex bg-slate-950 text-slate-100">
-  <!-- Barre latérale gauche : Sélecteur Multi-Tenant (Workspace), Projets & Console Admin -->
+  <!-- Barre latérale gauche : Sélecteur Multi-Tenant (Workspace), Projets, Compte & Console Admin -->
   <aside class="w-68 shrink-0 bg-slate-900 border-r border-slate-800 flex flex-col justify-between">
     <div class="p-4 space-y-4">
       <!-- En-tête Marque Aigle SaaS -->
@@ -228,7 +329,7 @@
               <span class="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 text-[9px] font-mono uppercase">SaaS</span>
             </div>
             <div class="text-[10px] text-emerald-400 font-mono truncate">
-              🔒 SSO Authelia Actif
+              🔒 SSO Authelia {authContext.totp_enabled ? '+ 2FA' : 'Actif'}
             </div>
           </div>
         </div>
@@ -293,20 +394,7 @@
           <span>Projets du Workspace</span>
           {#if authContext.can_manage_project}
             <button
-              onclick={() => {
-                newProj = {
-                  code: `PRJ${projects.length + 1}`,
-                  name: '',
-                  client_name: '',
-                  description: '',
-                  start_date: new Date().toISOString().slice(0, 10),
-                  target_end_date: '2027-01-31',
-                  initial_budget: 30000,
-                  default_hourly_rate: 75,
-                  currency: 'EUR',
-                };
-                showNewProjectModal = true;
-              }}
+              onclick={openNewProjectDialog}
               class="text-indigo-400 hover:text-indigo-300 cursor-pointer"
             >
               + Nouveau
@@ -314,7 +402,7 @@
           {/if}
         </div>
 
-        <div class="space-y-1.5 max-h-[340px] overflow-y-auto pr-0.5">
+        <div class="space-y-1.5 max-h-[310px] overflow-y-auto pr-0.5">
           {#each projects as p (p.id)}
             {@const f = p.financials || {}}
             {@const isSelected = activeProjectId === p.id && activeTab !== 'portfolio' && activeTab !== 'admin'}
@@ -325,9 +413,16 @@
                 : 'bg-slate-950/40 border-slate-800/80 text-slate-300 hover:bg-slate-800/50'}"
             >
               <div class="flex items-center justify-between mb-1">
-                <span class="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">
-                  {p.code}
-                </span>
+                <div class="flex items-center gap-1">
+                  <span class="font-mono text-[10px] font-bold px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">
+                    {p.code}
+                  </span>
+                  {#if p.require_totp}
+                    <span class="px-1 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[9px] font-mono" title="Projet protégé par Double Authentification 2FA TOTP">
+                      🔐 2FA
+                    </span>
+                  {/if}
+                </div>
                 <span
                   class="text-[10px] font-mono {(f.variance || 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}"
                   title="Atterrissage vs Budget"
@@ -345,9 +440,9 @@
       </div>
     </div>
 
-    <!-- Pied de barre latérale : Profil SSO Authelia + Badge Rôle RBAC + Infrastructure -->
-    <div class="p-3 border-t border-slate-800 bg-slate-950/60 space-y-2.5 text-xs">
-      <div class="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1.5">
+    <!-- Pied de barre latérale : Profil SSO Authelia + Bouton Mon Compte (Mot de passe & 2FA TOTP) -->
+    <div class="p-3 border-t border-slate-800 bg-slate-950/60 space-y-2 text-xs">
+      <div class="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
         <div class="flex items-center justify-between">
           <span class="font-semibold text-white truncate">{authContext.user?.display_name || authContext.user?.username}</span>
           <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold border {userRoleBadge.class}">
@@ -355,6 +450,17 @@
           </span>
         </div>
         <div class="text-[10px] text-slate-400 font-mono truncate">{authContext.user?.email}</div>
+
+        <button
+          onclick={() => (showAccountModal = true)}
+          class="w-full py-1.5 px-2.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-200 font-semibold text-[11px] flex items-center justify-between cursor-pointer"
+        >
+          <span>👤 Mon Compte / MDP</span>
+          <span class="font-mono text-[9px] px-1.5 py-0.5 rounded {authContext.totp_enabled ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'}">
+            {authContext.totp_enabled ? '2FA OK' : '2FA'}
+          </span>
+        </button>
+
         <div class="flex items-center justify-between pt-1 border-t border-slate-800/80 text-[10px]">
           <span class="text-emerald-400 font-mono">SSO: {authContext.auth_mode}</span>
           <a
@@ -395,15 +501,15 @@
             </div>
             <h1 class="text-xl font-bold text-white">Portefeuille Multi-Projets — Synthèse Direction</h1>
             <p class="text-xs text-slate-400">
-              Vue consolidée des budgets initiaux, des consommés, des restes à faire (RAF) et des atterrissages sur l'espace client actif.
+              Vue consolidée des budgets initiaux, des consommés, des restes à faire (RAF), des Maîtres de projet et de la protection 2FA TOTP.
             </p>
           </div>
           {#if authContext.can_manage_project}
             <button
-              onclick={() => (showNewProjectModal = true)}
+              onclick={openNewProjectDialog}
               class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
             >
-              + Créer un Projet
+              + Créer un Projet (Maître & Droits)
             </button>
           {/if}
         </div>
@@ -442,26 +548,36 @@
         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
           {#each projects as p (p.id)}
             {@const f = p.financials || {}}
+            {@const myRole = PROJECT_ROLE_PRESETS[p.my_permissions?.project_role] || PROJECT_ROLE_PRESETS.contributor}
             <div
               onclick={() => selectProject(p.id)}
+              role="button"
+              tabindex="0"
+              onkeydown={(e) => e.key === 'Enter' && selectProject(p.id)}
               class="p-5 rounded-2xl bg-slate-900 border border-slate-800 hover:border-indigo-500/50 transition cursor-pointer space-y-4"
             >
               <div class="flex items-start justify-between">
                 <div>
-                  <div class="flex items-center gap-2">
+                  <div class="flex items-center gap-2 flex-wrap">
                     <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono text-xs font-bold">
                       {p.code}
                     </span>
                     <h3 class="text-base font-bold text-white">{p.name}</h3>
+                    {#if p.require_totp}
+                      <span class="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono">
+                        🔐 2FA TOTP
+                      </span>
+                    {/if}
                   </div>
-                  <p class="text-xs text-slate-400 mt-1">{p.client_name || 'Projet interne'} • {p.start_date} → {p.target_end_date}</p>
+                  <p class="text-xs text-slate-400 mt-1">
+                    {p.client_name || 'Projet interne'} • {p.start_date} → {p.target_end_date}
+                    {#if p.owner_name}
+                      • 👑 Maître : <strong class="text-slate-300">{p.owner_name}</strong>
+                    {/if}
+                  </p>
                 </div>
-                <span
-                  class="px-2.5 py-1 rounded-full text-xs font-mono font-semibold {(f.variance || 0) >= 0
-                    ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                    : 'bg-rose-500/15 text-rose-300 border border-rose-500/30'}"
-                >
-                  Écart: {(f.variance || 0) >= 0 ? '+' : ''}{formatCurrency(f.variance, p.currency)}
+                <span class="px-2 py-0.5 rounded border text-[10px] font-semibold {myRole.badge}">
+                  {myRole.label}
                 </span>
               </div>
 
@@ -489,19 +605,93 @@
           {/each}
         </div>
       </div>
+    {:else if totpChallenge}
+      <!-- Écran de Déverrouillage 2FA TOTP d'un Projet Protégé (TODO #3) -->
+      <div class="flex-1 flex items-center justify-center p-6">
+        <div class="max-w-md w-full p-6 rounded-2xl bg-slate-900 border border-emerald-500/40 shadow-2xl space-y-4 text-xs">
+          <div class="flex items-center gap-3">
+            <div class="w-12 h-12 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-2xl">
+              🔐
+            </div>
+            <div>
+              <div class="text-[10px] font-mono uppercase text-emerald-400">Protection 2FA TOTP par Projet</div>
+              <h2 class="text-base font-bold text-white">
+                Déverrouiller « {totpChallenge.project_name || totpChallenge.project_code} »
+              </h2>
+            </div>
+          </div>
+
+          <p class="text-slate-300 leading-relaxed">
+            Ce projet exige une <strong>double authentification (2FA TOTP)</strong>. Veuillez saisir le code temporaire à 6 chiffres généré par votre application d'authentification (Google Authenticator, Authy, Bitwarden).
+          </p>
+
+          {#if totpChallengeErr}
+            <div class="p-3 rounded-xl bg-rose-950/50 border border-rose-500/40 text-rose-300">
+              {totpChallengeErr}
+            </div>
+          {/if}
+
+          {#if !authContext.totp_enabled && !totpChallenge.totp_enabled}
+            <div class="p-4 rounded-xl bg-amber-950/40 border border-amber-500/40 space-y-2.5">
+              <div class="font-semibold text-amber-300">⚠️ Vous n'avez pas encore activé la 2FA TOTP sur votre compte</div>
+              <p class="text-[11px] text-slate-300">
+                Cliquez ci-dessous pour scanner votre QR Code TOTP dans « Mon Compte », puis revenez déverrouiller ce projet.
+              </p>
+              <button
+                onclick={() => (showAccountModal = true)}
+                class="w-full py-2 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-semibold cursor-pointer"
+              >
+                📲 Activer mon QR Code 2FA TOTP dans Mon Compte
+              </button>
+            </div>
+          {:else}
+            <form onsubmit={submitProjectTOTPChallenge} class="space-y-3">
+              <div>
+                <label for="proj-totp-code" class="block text-slate-400 mb-1">Code TOTP à 6 chiffres</label>
+                <input
+                  id="proj-totp-code"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="6"
+                  required
+                  bind:value={totpChallengeCode}
+                  placeholder="000000"
+                  class="w-full px-4 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white font-mono text-lg tracking-widest text-center"
+                />
+              </div>
+              <button
+                type="submit"
+                class="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold cursor-pointer"
+              >
+                🔓 Vérifier le code 2FA & Ouvrir le Projet
+              </button>
+            </form>
+          {/if}
+        </div>
+      </div>
     {:else if projectData.project}
       {@const proj = projectData.project}
       {@const fin = projectData.financials || {}}
+      {@const myPerm = projectData.my_permissions || {}}
+      {@const myProjRole = PROJECT_ROLE_PRESETS[myPerm.project_role] || PROJECT_ROLE_PRESETS.contributor}
 
       <!-- Bandeau Financier & Timeline Persistant du Projet -->
       <header class="px-6 py-3.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4">
         <div class="space-y-0.5">
-          <div class="flex items-center gap-2">
+          <div class="flex items-center gap-2 flex-wrap">
             <span class="px-2 py-0.5 rounded bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 font-mono text-xs font-bold">
               {proj.code}
             </span>
             <h1 class="text-base font-bold text-white">{proj.name}</h1>
             <span class="text-xs text-slate-500">({proj.start_date} → {proj.target_end_date})</span>
+            <span class="px-2 py-0.5 rounded border text-[10px] font-semibold {myProjRole.badge}" title="Votre rôle sur ce projet">
+              {myProjRole.label}
+            </span>
+            {#if proj.require_totp}
+              <span class="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[10px] font-mono">
+                🔐 2FA TOTP Actif
+              </span>
+            {/if}
           </div>
           <p class="text-xs text-slate-400">{proj.description}</p>
         </div>
@@ -581,6 +771,16 @@
           <span class="ml-1 px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono">{projectData.docs.length}</span>
         </button>
 
+        <button
+          onclick={() => (activeTab = 'access')}
+          class="px-4 py-3 font-semibold border-b-2 transition cursor-pointer shrink-0 {activeTab === 'access'
+            ? 'border-amber-500 text-amber-300 bg-amber-950/20'
+            : 'border-transparent text-amber-400/80 hover:text-amber-300'}"
+        >
+          👥 5. Équipe, Droits Fins & 2FA TOTP
+          <span class="ml-1 px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono">{(projectData.project_members || []).length}</span>
+        </button>
+
         {#if authContext.is_admin}
           <button
             onclick={() => (activeTab = 'admin')}
@@ -588,7 +788,7 @@
               ? 'border-rose-500 text-rose-300 bg-rose-950/20'
               : 'border-transparent text-rose-400/80 hover:text-rose-300'}"
           >
-            🛡️ 5. Administration SaaS & Sécurité
+            🛡️ 6. Administration SaaS
           </button>
         {/if}
       </nav>
@@ -631,6 +831,13 @@
             wbsNodes={projectData.wbs_nodes}
             onRefresh={loadActiveProject}
           />
+        {:else if activeTab === 'access'}
+          <ProjectAccessView
+            project={proj}
+            myPermissions={projectData.my_permissions}
+            onRefresh={loadActiveProject}
+            onOpenAccountModal={() => (showAccountModal = true)}
+          />
         {/if}
       </div>
     {:else}
@@ -642,7 +849,7 @@
         </p>
         {#if authContext.can_manage_project}
           <button
-            onclick={() => (showNewProjectModal = true)}
+            onclick={openNewProjectDialog}
             class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold cursor-pointer"
           >
             + Créer le premier projet de ce Workspace
@@ -653,24 +860,47 @@
   </main>
 </div>
 
-<!-- Modale : Créer un Nouveau Projet -->
+<!-- Modale : Mon Compte, Changement de Mot de Passe & Enrôlement 2FA TOTP (TODO #1 & #3) -->
+{#if showAccountModal}
+  <AccountModal
+    onClose={() => (showAccountModal = false)}
+    onAccountUpdated={async () => {
+      await loadIdentityAndWorkspaces();
+      if (activeProjectId) await loadActiveProject();
+    }}
+  />
+{/if}
+
+<!-- Modale : Créer un Nouveau Projet avec Maître du Projet, Équipe & 2FA TOTP (TODO #2 & #3) -->
 {#if showNewProjectModal}
-  <div class="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+  <div class="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center z-50 p-4">
     <form
       onsubmit={createNewProject}
-      class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-lg p-6 space-y-4 shadow-2xl text-xs"
+      class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl p-6 space-y-4 shadow-2xl text-xs max-h-[90vh] overflow-y-auto"
     >
       <div class="flex items-center justify-between border-b border-slate-800 pb-3">
-        <h3 class="text-base font-semibold text-white">
-          Créer un Projet dans « {authContext.active_workspace?.name || 'Workspace'} »
-        </h3>
+        <div>
+          <h3 class="text-base font-bold text-white">
+            Créer un Nouveau Projet dans « {authContext.active_workspace?.name || 'Workspace'} »
+          </h3>
+          <p class="text-[11px] text-slate-400">
+            Définissez le cadre budgétaire, le Maître du Projet, les membres et leurs droits fins ainsi que la politique 2FA TOTP.
+          </p>
+        </div>
         <button type="button" onclick={() => (showNewProjectModal = false)} class="text-slate-400 hover:text-white cursor-pointer">✕</button>
       </div>
 
+      {#if newProjErr}
+        <div class="p-3 rounded-xl bg-rose-950/50 border border-rose-500/40 text-rose-300">
+          {newProjErr}
+        </div>
+      {/if}
+
       <div class="grid grid-cols-3 gap-3">
         <div>
-          <label class="block text-slate-400 mb-1">Code Projet (Clé)</label>
+          <label for="np-code" class="block text-slate-400 mb-1">Code Projet (Clé)</label>
           <input
+            id="np-code"
             type="text"
             required
             maxlength="6"
@@ -680,8 +910,9 @@
           />
         </div>
         <div class="col-span-2">
-          <label class="block text-slate-400 mb-1">Nom du Projet</label>
+          <label for="np-name" class="block text-slate-400 mb-1">Nom du Projet</label>
           <input
+            id="np-name"
             type="text"
             required
             bind:value={newProj.name}
@@ -691,19 +922,37 @@
         </div>
       </div>
 
-      <div>
-        <label class="block text-slate-400 mb-1">Client / Direction</label>
-        <input
-          type="text"
-          bind:value={newProj.client_name}
-          class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white"
-        />
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label for="np-client" class="block text-slate-400 mb-1">Client / Direction</label>
+          <input
+            id="np-client"
+            type="text"
+            bind:value={newProj.client_name}
+            class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white"
+          />
+        </div>
+        <div>
+          <label for="np-owner" class="block text-amber-300 font-semibold mb-1">👑 Maître Principal du Projet (Owner)</label>
+          <select
+            id="np-owner"
+            bind:value={newProj.owner_user_id}
+            class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-amber-500/40 text-white"
+          >
+            {#each workspaceUsers as u (u.id)}
+              <option value={u.id}>
+                {u.display_name || u.username} ({u.email})
+              </option>
+            {/each}
+          </select>
+        </div>
       </div>
 
-      <div class="grid grid-cols-2 gap-3">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div>
-          <label class="block text-slate-400 mb-1">Date de Début</label>
+          <label for="np-start" class="block text-slate-400 mb-1">Date de Début</label>
           <input
+            id="np-start"
             type="date"
             required
             bind:value={newProj.start_date}
@@ -711,20 +960,19 @@
           />
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Date de Fin Cible</label>
+          <label for="np-end" class="block text-slate-400 mb-1">Date de Fin Cible</label>
           <input
+            id="np-end"
             type="date"
             required
             bind:value={newProj.target_end_date}
             class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white"
           />
         </div>
-      </div>
-
-      <div class="grid grid-cols-2 gap-3">
         <div>
-          <label class="block text-slate-400 mb-1">Budget Initial Global (€)</label>
+          <label for="np-budget" class="block text-slate-400 mb-1">Budget Initial (€)</label>
           <input
+            id="np-budget"
             type="number"
             step="1000"
             required
@@ -733,8 +981,9 @@
           />
         </div>
         <div>
-          <label class="block text-slate-400 mb-1">Taux Horaire par Défaut (€/h)</label>
+          <label for="np-rate" class="block text-slate-400 mb-1">Taux Horaire (€/h)</label>
           <input
+            id="np-rate"
             type="number"
             step="5"
             required
@@ -745,24 +994,87 @@
       </div>
 
       <div>
-        <label class="block text-slate-400 mb-1">Objectifs & Description</label>
+        <label for="np-desc" class="block text-slate-400 mb-1">Objectifs & Description</label>
         <textarea
+          id="np-desc"
           rows="2"
           bind:value={newProj.description}
           class="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 text-white"
         ></textarea>
       </div>
 
+      <!-- Ajout d'utilisateurs initiaux au projet avec leurs rôles (TODO #2) -->
+      <div class="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+        <div class="font-semibold text-white">👥 Ajouter d'autres utilisateurs au projet (avec gestion fine des droits)</div>
+        <div class="flex flex-wrap items-center gap-2">
+          <select
+            bind:value={draftMemberUserId}
+            class="flex-1 min-w-[180px] px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white"
+          >
+            {#each workspaceUsers as u (u.id)}
+              <option value={u.id}>{u.display_name || u.username} ({u.email})</option>
+            {/each}
+          </select>
+          <select
+            bind:value={draftMemberRole}
+            class="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-white"
+          >
+            {#each Object.entries(PROJECT_ROLE_PRESETS) as [rk, rInfo]}
+              <option value={rk}>{rInfo.label}</option>
+            {/each}
+          </select>
+          <button
+            type="button"
+            onclick={addDraftProjectMember}
+            class="px-3 py-1.5 rounded-lg bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 font-semibold cursor-pointer"
+          >
+            + Ajouter au projet
+          </button>
+        </div>
+
+        {#if newProj.project_members.length > 0}
+          <div class="space-y-1 pt-1">
+            {#each newProj.project_members as pm (pm.user_id)}
+              <div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800">
+                <span>
+                  <strong class="text-white">{pm.user_name}</strong> ({pm.user_email}) —
+                  <span class="text-indigo-300">{PROJECT_ROLE_PRESETS[pm.project_role]?.label}</span>
+                </span>
+                <button
+                  type="button"
+                  onclick={() => removeDraftProjectMember(pm.user_id)}
+                  class="text-rose-400 hover:underline text-[10px] cursor-pointer"
+                >
+                  Retirer
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
+      <!-- Option 2FA TOTP par Projet (TODO #3) -->
+      <div class="p-3.5 rounded-xl bg-slate-950 border border-emerald-500/30 flex items-center justify-between gap-3">
+        <label class="flex items-center gap-2.5 cursor-pointer">
+          <input type="checkbox" bind:checked={newProj.require_totp} class="w-4 h-4 accent-emerald-500" />
+          <div>
+            <div class="font-semibold text-emerald-300">🔐 Exiger la Double Authentification (2FA TOTP) sur ce projet</div>
+            <div class="text-[10px] text-slate-400">
+              Synchronise une règle <code class="text-slate-300">two_factor</code> dans Authelia et demande un code TOTP à 6 chiffres à l'ouverture du projet.
+            </div>
+          </div>
+        </label>
+      </div>
+
       <div class="flex justify-end gap-2 pt-3 border-t border-slate-800">
         <button type="button" onclick={() => (showNewProjectModal = false)} class="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 cursor-pointer">
           Annuler
         </button>
-        <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium cursor-pointer">
-          Créer le Projet
+        <button type="submit" class="px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-semibold cursor-pointer">
+          🚀 Créer le Projet
         </button>
       </div>
     </form>
   </div>
 {/if}
 {/if}
-

@@ -21,7 +21,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
-      - "traefik.http.routers.aigle-auth.rule=Host(`airgle-auth.heimerdinger.studio`) || Host(`aigle-auth.heimerdinger.studio`)"
+      - "traefik.http.routers.aigle-auth.rule=Host(`aigle-auth.heimerdinger.studio`)"
       - "traefik.http.routers.aigle-auth.entrypoints=websecure"
       - "traefik.http.routers.aigle-auth.tls=true"
       - "traefik.http.routers.aigle-auth.tls.certresolver=myresolver"

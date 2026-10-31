@@ -3,7 +3,8 @@
 //   - 100% des requêtes SQL utilisent des paramètres liés (Prepared/Parameterized Statements),
 //     éliminant toute vulnérabilité d'injection SQL (OWASP A03).
 //   - Traduction automatique des placeholders '?' vers '$1, $2, ...' lorsque PostgreSQL est utilisé.
-//   - Isolation Multi-Tenant par workspace_id et journalisation d'audit immuable (audit_logs).
+//   - Isolation Multi-Tenant par workspace_id, permissions granulaires par projet (project_members),
+//     support 2FA TOTP par utilisateur et par projet, et journalisation d'audit immuable (audit_logs).
 package database
 
 import (
@@ -118,7 +119,7 @@ func Open(cfg *config.ServerConfig) (*Store, error) {
 	return store, nil
 }
 
-// Migrate crée l'ensemble des tables SaaS (Workspaces, Users, AuditLogs, Projects, WBS, Tickets, TimeLogs, Docs).
+// Migrate crée l'ensemble des tables SaaS et applique les évolutions de schéma de façon idempotente.
 func (s *Store) Migrate() error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS workspaces (
@@ -141,6 +142,10 @@ func (s *Store) Migrate() error {
 			groups TEXT NOT NULL DEFAULT '',
 			workspace_id TEXT NOT NULL DEFAULT 'ws_default',
 			is_active BOOLEAN NOT NULL DEFAULT TRUE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			totp_secret TEXT NOT NULL DEFAULT '',
+			totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			totp_verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -179,8 +184,28 @@ func (s *Store) Migrate() error {
 			initial_budget REAL NOT NULL DEFAULT 0,
 			default_hourly_rate REAL NOT NULL DEFAULT 65.0,
 			currency TEXT NOT NULL DEFAULT 'EUR',
+			owner_user_id TEXT NOT NULL DEFAULT '',
+			require_totp BOOLEAN NOT NULL DEFAULT FALSE,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS project_members (
+			id TEXT PRIMARY KEY,
+			project_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			user_email TEXT NOT NULL DEFAULT '',
+			user_name TEXT NOT NULL DEFAULT '',
+			project_role TEXT NOT NULL DEFAULT 'contributor',
+			can_read BOOLEAN NOT NULL DEFAULT TRUE,
+			can_write_tickets BOOLEAN NOT NULL DEFAULT TRUE,
+			can_delete_tickets BOOLEAN NOT NULL DEFAULT FALSE,
+			can_execute BOOLEAN NOT NULL DEFAULT TRUE,
+			can_edit_gantt BOOLEAN NOT NULL DEFAULT FALSE,
+			can_edit_wiki BOOLEAN NOT NULL DEFAULT TRUE,
+			can_view_finance BOOLEAN NOT NULL DEFAULT FALSE,
+			can_manage_members BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(project_id, user_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS wbs_nodes (
 			id TEXT PRIMARY KEY,
@@ -257,23 +282,41 @@ func (s *Store) Migrate() error {
 			return err
 		}
 	}
+
+	// Migrations incrémentales idempotentes pour les bases PostgreSQL / SQLite déjà existantes
+	alterStmts := []string{
+		`ALTER TABLE users ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN totp_secret TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE users ADD COLUMN totp_verified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`,
+		`ALTER TABLE projects ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE projects ADD COLUMN require_totp BOOLEAN NOT NULL DEFAULT FALSE`,
+	}
+	for _, alt := range alterStmts {
+		_, _ = s.DB.Exec(alt)
+	}
+
 	return nil
 }
 
-// --- Gestion des Utilisateurs SSO Authelia & RBAC ---
+// --- Gestion des Utilisateurs SSO Authelia, Compte Personnel & 2FA TOTP ---
 
 // SyncAuthenticatedUser synchronise en base de données l'utilisateur authentifié par Authelia ForwardAuth.
-// Si un administrateur a explicitement forcé un rôle ou un workspace (ou désactivé le compte en base),
-// ces paramètres administratifs sont respectés.
 func (s *Store) SyncAuthenticatedUser(u *models.User) (*models.User, error) {
 	var existing models.User
+	var totpVerified sql.NullTime
 	err := s.queryRow(`
-		SELECT id, username, email, display_name, role, groups, workspace_id, is_active, last_login_at, created_at
+		SELECT id, username, email, display_name, role, groups, workspace_id, is_active,
+		       password_hash, totp_secret, totp_enabled, totp_verified_at, last_login_at, created_at
 		FROM users WHERE email = ?`, u.Email).Scan(
 		&existing.ID, &existing.Username, &existing.Email, &existing.DisplayName,
 		&existing.Role, &existing.Groups, &existing.WorkspaceID, &existing.IsActive,
-		&existing.LastLoginAt, &existing.CreatedAt,
+		&existing.PasswordHash, &existing.TOTPSecret, &existing.TOTPEnabled,
+		&totpVerified, &existing.LastLoginAt, &existing.CreatedAt,
 	)
+	if totpVerified.Valid {
+		existing.TOTPVerifiedAt = totpVerified.Time
+	}
 
 	now := time.Now()
 	if err == sql.ErrNoRows {
@@ -284,35 +327,58 @@ func (s *Store) SyncAuthenticatedUser(u *models.User) (*models.User, error) {
 		u.IsActive = true
 		u.LastLoginAt = now
 		u.CreatedAt = now
+		u.TOTPVerifiedAt = time.Time{}
 		_, insertErr := s.exec(`
-			INSERT INTO users (id, username, email, display_name, role, groups, workspace_id, is_active, last_login_at, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			u.ID, u.Username, u.Email, u.DisplayName, u.Role, u.Groups, u.WorkspaceID, u.IsActive, u.LastLoginAt, u.CreatedAt,
+			INSERT INTO users (id, username, email, display_name, role, groups, workspace_id, is_active, password_hash, totp_secret, totp_enabled, totp_verified_at, last_login_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			u.ID, u.Username, u.Email, u.DisplayName, u.Role, u.Groups, u.WorkspaceID, u.IsActive, "", "", false, time.Unix(0, 0), u.LastLoginAt, u.CreatedAt,
 		)
 		return u, insertErr
 	} else if err != nil {
 		return u, err
 	}
 
-	// Met à jour la date de dernière connexion et les groupes Authelia
 	existing.LastLoginAt = now
 	if u.Groups != "" {
 		existing.Groups = u.Groups
 	}
-	// Si l'utilisateur fait partie du groupe superadmin d'Authelia, il conserve au minimum ce privilège
 	if u.Role == models.RoleSuperAdmin {
 		existing.Role = models.RoleSuperAdmin
 	}
-	_, _ = s.exec(`UPDATE users SET last_login_at = ?, groups = ?, display_name = ? WHERE id = ?`,
-		existing.LastLoginAt, existing.Groups, u.DisplayName, existing.ID)
+	if existing.DisplayName == "" && u.DisplayName != "" {
+		existing.DisplayName = u.DisplayName
+	}
+	_, _ = s.exec(`UPDATE users SET last_login_at = ?, groups = ? WHERE id = ?`,
+		existing.LastLoginAt, existing.Groups, existing.ID)
 
 	return &existing, nil
 }
 
-// GetUsers retourne tous les utilisateurs enregistrés sur la plateforme SaaS (pour la Console d'Administration).
+// GetUserByID retourne un utilisateur par son ID avec ses métadonnées 2FA et hash mot de passe.
+func (s *Store) GetUserByID(id string) (*models.User, error) {
+	var u models.User
+	var totpVerified sql.NullTime
+	err := s.queryRow(`
+		SELECT id, username, email, display_name, role, groups, workspace_id, is_active,
+		       password_hash, totp_secret, totp_enabled, totp_verified_at, last_login_at, created_at
+		FROM users WHERE id = ?`, id).Scan(
+		&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.Role, &u.Groups, &u.WorkspaceID, &u.IsActive,
+		&u.PasswordHash, &u.TOTPSecret, &u.TOTPEnabled, &totpVerified, &u.LastLoginAt, &u.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if totpVerified.Valid {
+		u.TOTPVerifiedAt = totpVerified.Time
+	}
+	return &u, nil
+}
+
+// GetUsers retourne tous les utilisateurs enregistrés sur la plateforme SaaS.
 func (s *Store) GetUsers() ([]models.User, error) {
 	rows, err := s.query(`
-		SELECT id, username, email, display_name, role, groups, workspace_id, is_active, last_login_at, created_at
+		SELECT id, username, email, display_name, role, groups, workspace_id, is_active,
+		       totp_enabled, totp_verified_at, last_login_at, created_at
 		FROM users ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -322,8 +388,12 @@ func (s *Store) GetUsers() ([]models.User, error) {
 	var list []models.User
 	for rows.Next() {
 		var u models.User
-		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.Role, &u.Groups, &u.WorkspaceID, &u.IsActive, &u.LastLoginAt, &u.CreatedAt); err != nil {
+		var totpVerified sql.NullTime
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.Role, &u.Groups, &u.WorkspaceID, &u.IsActive, &u.TOTPEnabled, &totpVerified, &u.LastLoginAt, &u.CreatedAt); err != nil {
 			return nil, err
+		}
+		if totpVerified.Valid {
+			u.TOTPVerifiedAt = totpVerified.Time
 		}
 		list = append(list, u)
 	}
@@ -337,9 +407,9 @@ func (s *Store) SaveUser(u *models.User) error {
 		u.CreatedAt = time.Now()
 		u.LastLoginAt = u.CreatedAt
 		_, err := s.exec(`
-			INSERT INTO users (id, username, email, display_name, role, groups, workspace_id, is_active, last_login_at, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			u.ID, u.Username, strings.ToLower(u.Email), u.DisplayName, u.Role, u.Groups, u.WorkspaceID, u.IsActive, u.LastLoginAt, u.CreatedAt,
+			INSERT INTO users (id, username, email, display_name, role, groups, workspace_id, is_active, password_hash, totp_secret, totp_enabled, totp_verified_at, last_login_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			u.ID, u.Username, strings.ToLower(u.Email), u.DisplayName, u.Role, u.Groups, u.WorkspaceID, u.IsActive, u.PasswordHash, "", false, time.Unix(0, 0), u.LastLoginAt, u.CreatedAt,
 		)
 		return err
 	}
@@ -351,9 +421,37 @@ func (s *Store) SaveUser(u *models.User) error {
 	return err
 }
 
+// UpdateUserProfile permet à l'utilisateur connecté de modifier son nom d'affichage.
+func (s *Store) UpdateUserProfile(userID, displayName string) error {
+	_, err := s.exec(`UPDATE users SET display_name = ? WHERE id = ?`, displayName, userID)
+	return err
+}
+
+// UpdateUserPasswordHash enregistre l'empreinte Argon2id du mot de passe en base de données.
+func (s *Store) UpdateUserPasswordHash(userID, passwordHash string) error {
+	_, err := s.exec(`UPDATE users SET password_hash = ? WHERE id = ?`, passwordHash, userID)
+	return err
+}
+
+// SaveUserTOTPSecret enregistre le secret TOTP Base32 de l'utilisateur et son statut d'activation.
+func (s *Store) SaveUserTOTPSecret(userID, secret string, enabled bool) error {
+	verifiedAt := time.Unix(0, 0)
+	if enabled {
+		verifiedAt = time.Now()
+	}
+	_, err := s.exec(`UPDATE users SET totp_secret = ?, totp_enabled = ?, totp_verified_at = ? WHERE id = ?`,
+		secret, enabled, verifiedAt, userID)
+	return err
+}
+
+// MarkUserTOTPVerified horodate la réussite d'une vérification 2FA TOTP pour l'utilisateur.
+func (s *Store) MarkUserTOTPVerified(userID string, verifiedAt time.Time) error {
+	_, err := s.exec(`UPDATE users SET totp_verified_at = ? WHERE id = ?`, verifiedAt, userID)
+	return err
+}
+
 // --- Gestion des Workspaces (Multi-Tenants SaaS) ---
 
-// GetWorkspaces retourne tous les Workspaces (Tenants) avec leurs statistiques temps réel.
 func (s *Store) GetWorkspaces() ([]models.Workspace, error) {
 	rows, err := s.query(`
 		SELECT id, name, slug, description, status, max_projects, max_users, created_at, updated_at
@@ -377,7 +475,6 @@ func (s *Store) GetWorkspaces() ([]models.Workspace, error) {
 	return list, nil
 }
 
-// SaveWorkspace crée ou modifie un Workspace (Tenant).
 func (s *Store) SaveWorkspace(w *models.Workspace) error {
 	now := time.Now()
 	w.UpdatedAt = now
@@ -412,7 +509,6 @@ func (s *Store) SaveWorkspace(w *models.Workspace) error {
 
 // --- Journal d'Audit de Sécurité (Audit Trail) ---
 
-// AddAuditLog enregistre une trace d'audit de sécurité en base de données.
 func (s *Store) AddAuditLog(workspaceID, userEmail, userRole, action, targetType, targetID, details, ip string) {
 	if workspaceID == "" {
 		workspaceID = "ws_default"
@@ -424,7 +520,6 @@ func (s *Store) AddAuditLog(workspaceID, userEmail, userRole, action, targetType
 	)
 }
 
-// GetRecentAuditLogs retourne les N derniers événements du journal d'audit.
 func (s *Store) GetRecentAuditLogs(limit int) ([]models.AuditLog, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -503,19 +598,28 @@ func (s *Store) UpdateMember(m *models.Member) error {
 	return err
 }
 
-// --- Projets (Isolés par Workspace) ---
+// --- Projets, Maîtres de Projet & Droits Granulaires (TODO #2 & #3) ---
 
 func (s *Store) GetProjects(workspaceID string) ([]*models.Project, error) {
 	var rows *sql.Rows
 	var err error
 	if workspaceID != "" {
 		rows, err = s.query(`
-			SELECT id, workspace_id, code, name, description, client_name, status, start_date, target_end_date, initial_budget, default_hourly_rate, currency, created_at, updated_at
-			FROM projects WHERE workspace_id = ? ORDER BY created_at DESC`, workspaceID)
+			SELECT p.id, p.workspace_id, p.code, p.name, p.description, p.client_name, p.status,
+			       p.start_date, p.target_end_date, p.initial_budget, p.default_hourly_rate, p.currency,
+			       p.owner_user_id, COALESCE(u.display_name, ''), p.require_totp, p.created_at, p.updated_at
+			FROM projects p
+			LEFT JOIN users u ON u.id = p.owner_user_id
+			WHERE p.workspace_id = ?
+			ORDER BY p.created_at DESC`, workspaceID)
 	} else {
 		rows, err = s.query(`
-			SELECT id, workspace_id, code, name, description, client_name, status, start_date, target_end_date, initial_budget, default_hourly_rate, currency, created_at, updated_at
-			FROM projects ORDER BY created_at DESC`)
+			SELECT p.id, p.workspace_id, p.code, p.name, p.description, p.client_name, p.status,
+			       p.start_date, p.target_end_date, p.initial_budget, p.default_hourly_rate, p.currency,
+			       p.owner_user_id, COALESCE(u.display_name, ''), p.require_totp, p.created_at, p.updated_at
+			FROM projects p
+			LEFT JOIN users u ON u.id = p.owner_user_id
+			ORDER BY p.created_at DESC`)
 	}
 	if err != nil {
 		return nil, err
@@ -525,9 +629,14 @@ func (s *Store) GetProjects(workspaceID string) ([]*models.Project, error) {
 	var list []*models.Project
 	for rows.Next() {
 		p := &models.Project{}
-		if err := rows.Scan(&p.ID, &p.WorkspaceID, &p.Code, &p.Name, &p.Description, &p.ClientName, &p.Status, &p.StartDate, &p.TargetEndDate, &p.InitialBudget, &p.DefaultHourlyRate, &p.Currency, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(
+			&p.ID, &p.WorkspaceID, &p.Code, &p.Name, &p.Description, &p.ClientName, &p.Status,
+			&p.StartDate, &p.TargetEndDate, &p.InitialBudget, &p.DefaultHourlyRate, &p.Currency,
+			&p.OwnerUserID, &p.OwnerName, &p.RequireTOTP, &p.CreatedAt, &p.UpdatedAt,
+		); err != nil {
 			return nil, err
 		}
+		p.ProjectMembers, _ = s.GetProjectMembers(p.ID)
 		list = append(list, p)
 	}
 	return list, nil
@@ -536,13 +645,20 @@ func (s *Store) GetProjects(workspaceID string) ([]*models.Project, error) {
 func (s *Store) GetProject(id string) (*models.Project, error) {
 	p := &models.Project{}
 	err := s.queryRow(`
-		SELECT id, workspace_id, code, name, description, client_name, status, start_date, target_end_date, initial_budget, default_hourly_rate, currency, created_at, updated_at
-		FROM projects WHERE id = ?`, id).Scan(
-		&p.ID, &p.WorkspaceID, &p.Code, &p.Name, &p.Description, &p.ClientName, &p.Status, &p.StartDate, &p.TargetEndDate, &p.InitialBudget, &p.DefaultHourlyRate, &p.Currency, &p.CreatedAt, &p.UpdatedAt,
+		SELECT p.id, p.workspace_id, p.code, p.name, p.description, p.client_name, p.status,
+		       p.start_date, p.target_end_date, p.initial_budget, p.default_hourly_rate, p.currency,
+		       p.owner_user_id, COALESCE(u.display_name, ''), p.require_totp, p.created_at, p.updated_at
+		FROM projects p
+		LEFT JOIN users u ON u.id = p.owner_user_id
+		WHERE p.id = ?`, id).Scan(
+		&p.ID, &p.WorkspaceID, &p.Code, &p.Name, &p.Description, &p.ClientName, &p.Status,
+		&p.StartDate, &p.TargetEndDate, &p.InitialBudget, &p.DefaultHourlyRate, &p.Currency,
+		&p.OwnerUserID, &p.OwnerName, &p.RequireTOTP, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+	p.ProjectMembers, _ = s.GetProjectMembers(p.ID)
 	return p, nil
 }
 
@@ -567,24 +683,51 @@ func (s *Store) CreateProject(p *models.Project) error {
 	p.UpdatedAt = now
 
 	_, err := s.exec(`
-		INSERT INTO projects (id, workspace_id, code, name, description, client_name, status, start_date, target_end_date, initial_budget, default_hourly_rate, currency, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		p.ID, p.WorkspaceID, strings.ToUpper(p.Code), p.Name, p.Description, p.ClientName, p.Status, p.StartDate, p.TargetEndDate, p.InitialBudget, p.DefaultHourlyRate, p.Currency, p.CreatedAt, p.UpdatedAt,
+		INSERT INTO projects (id, workspace_id, code, name, description, client_name, status, start_date, target_end_date, initial_budget, default_hourly_rate, currency, owner_user_id, require_totp, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.WorkspaceID, strings.ToUpper(p.Code), p.Name, p.Description, p.ClientName, p.Status, p.StartDate, p.TargetEndDate, p.InitialBudget, p.DefaultHourlyRate, p.Currency, p.OwnerUserID, p.RequireTOTP, p.CreatedAt, p.UpdatedAt,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Si un Maître du Projet (OwnerUserID) est défini, l'inscrire automatiquement dans project_members avec le rôle 'owner'
+	if p.OwnerUserID != "" {
+		u, uErr := s.GetUserByID(p.OwnerUserID)
+		ownerPerm := models.PresetPermissionsForRole(models.ProjectRoleOwner)
+		ownerPerm.ProjectID = p.ID
+		ownerPerm.UserID = p.OwnerUserID
+		if uErr == nil && u != nil {
+			ownerPerm.UserEmail = u.Email
+			ownerPerm.UserName = u.DisplayName
+		}
+		_ = s.SaveProjectMember(&ownerPerm)
+	}
+
+	// Enregistre également les autres membres initiaux éventuellement fournis lors de la création
+	for i := range p.ProjectMembers {
+		pm := p.ProjectMembers[i]
+		pm.ProjectID = p.ID
+		if pm.UserID != "" {
+			_ = s.SaveProjectMember(&pm)
+		}
+	}
+
+	return nil
 }
 
 func (s *Store) UpdateProject(p *models.Project) error {
 	p.UpdatedAt = time.Now()
 	_, err := s.exec(`
-		UPDATE projects SET code = ?, name = ?, description = ?, client_name = ?, status = ?, start_date = ?, target_end_date = ?, initial_budget = ?, default_hourly_rate = ?, currency = ?, updated_at = ?
+		UPDATE projects SET code = ?, name = ?, description = ?, client_name = ?, status = ?, start_date = ?, target_end_date = ?, initial_budget = ?, default_hourly_rate = ?, currency = ?, owner_user_id = ?, require_totp = ?, updated_at = ?
 		WHERE id = ?`,
-		strings.ToUpper(p.Code), p.Name, p.Description, p.ClientName, p.Status, p.StartDate, p.TargetEndDate, p.InitialBudget, p.DefaultHourlyRate, p.Currency, p.UpdatedAt, p.ID,
+		strings.ToUpper(p.Code), p.Name, p.Description, p.ClientName, p.Status, p.StartDate, p.TargetEndDate, p.InitialBudget, p.DefaultHourlyRate, p.Currency, p.OwnerUserID, p.RequireTOTP, p.UpdatedAt, p.ID,
 	)
 	return err
 }
 
 func (s *Store) DeleteProject(id string) error {
+	_, _ = s.exec(`DELETE FROM project_members WHERE project_id = ?`, id)
 	_, _ = s.exec(`DELETE FROM time_logs WHERE ticket_id IN (SELECT id FROM tickets WHERE project_id = ?)`, id)
 	_, _ = s.exec(`DELETE FROM tickets WHERE project_id = ?`, id)
 	_, _ = s.exec(`DELETE FROM wbs_dependencies WHERE project_id = ?`, id)
@@ -592,6 +735,194 @@ func (s *Store) DeleteProject(id string) error {
 	_, _ = s.exec(`DELETE FROM doc_pages WHERE project_id = ?`, id)
 	_, err := s.exec(`DELETE FROM projects WHERE id = ?`, id)
 	return err
+}
+
+// GetTOTPRequiredProjectIDs retourne la liste des ID de projets qui exigent la double authentification 2FA TOTP.
+func (s *Store) GetTOTPRequiredProjectIDs() ([]string, error) {
+	rows, err := s.query(`SELECT id FROM projects WHERE require_totp = ? ORDER BY created_at ASC`, true)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil && id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// --- Gestion des Membres & Permissions Fines d'un Projet (project_members) ---
+
+func (s *Store) GetProjectMembers(projectID string) ([]models.ProjectMember, error) {
+	rows, err := s.query(`
+		SELECT pm.id, pm.project_id, pm.user_id,
+		       COALESCE(NULLIF(pm.user_email, ''), u.email, ''),
+		       COALESCE(NULLIF(pm.user_name, ''), u.display_name, u.username, ''),
+		       pm.project_role,
+		       pm.can_read, pm.can_write_tickets, pm.can_delete_tickets, pm.can_execute,
+		       pm.can_edit_gantt, pm.can_edit_wiki, pm.can_view_finance, pm.can_manage_members,
+		       pm.created_at
+		FROM project_members pm
+		LEFT JOIN users u ON u.id = pm.user_id
+		WHERE pm.project_id = ?
+		ORDER BY CASE pm.project_role
+			WHEN 'owner' THEN 1
+			WHEN 'manager' THEN 2
+			WHEN 'contributor' THEN 3
+			WHEN 'executor' THEN 4
+			ELSE 5
+		END, pm.created_at ASC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []models.ProjectMember
+	for rows.Next() {
+		var pm models.ProjectMember
+		if err := rows.Scan(
+			&pm.ID, &pm.ProjectID, &pm.UserID, &pm.UserEmail, &pm.UserName, &pm.ProjectRole,
+			&pm.CanRead, &pm.CanWriteTickets, &pm.CanDeleteTickets, &pm.CanExecute,
+			&pm.CanEditGantt, &pm.CanEditWiki, &pm.CanViewFinance, &pm.CanManageMembers,
+			&pm.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		list = append(list, pm)
+	}
+	return list, nil
+}
+
+func (s *Store) SaveProjectMember(pm *models.ProjectMember) error {
+	if pm.ID == "" {
+		pm.ID = NewID("pm")
+	}
+	if pm.CreatedAt.IsZero() {
+		pm.CreatedAt = time.Now()
+	}
+	if pm.ProjectRole == "" {
+		pm.ProjectRole = models.ProjectRoleContributor
+	}
+	// Si le rôle est 'owner' (Maître du Projet), toutes les permissions sont garanties actives
+	if pm.ProjectRole == models.ProjectRoleOwner {
+		pm.CanRead = true
+		pm.CanWriteTickets = true
+		pm.CanDeleteTickets = true
+		pm.CanExecute = true
+		pm.CanEditGantt = true
+		pm.CanEditWiki = true
+		pm.CanViewFinance = true
+		pm.CanManageMembers = true
+	}
+	if pm.UserEmail == "" || pm.UserName == "" {
+		if u, err := s.GetUserByID(pm.UserID); err == nil && u != nil {
+			if pm.UserEmail == "" {
+				pm.UserEmail = u.Email
+			}
+			if pm.UserName == "" {
+				pm.UserName = u.DisplayName
+			}
+		}
+	}
+
+	_, err := s.exec(`
+		INSERT INTO project_members (
+			id, project_id, user_id, user_email, user_name, project_role,
+			can_read, can_write_tickets, can_delete_tickets, can_execute,
+			can_edit_gantt, can_edit_wiki, can_view_finance, can_manage_members, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_id, user_id) DO UPDATE SET
+			user_email = excluded.user_email,
+			user_name = excluded.user_name,
+			project_role = excluded.project_role,
+			can_read = excluded.can_read,
+			can_write_tickets = excluded.can_write_tickets,
+			can_delete_tickets = excluded.can_delete_tickets,
+			can_execute = excluded.can_execute,
+			can_edit_gantt = excluded.can_edit_gantt,
+			can_edit_wiki = excluded.can_edit_wiki,
+			can_view_finance = excluded.can_view_finance,
+			can_manage_members = excluded.can_manage_members`,
+		pm.ID, pm.ProjectID, pm.UserID, strings.ToLower(pm.UserEmail), pm.UserName, pm.ProjectRole,
+		pm.CanRead, pm.CanWriteTickets, pm.CanDeleteTickets, pm.CanExecute,
+		pm.CanEditGantt, pm.CanEditWiki, pm.CanViewFinance, pm.CanManageMembers, pm.CreatedAt,
+	)
+	return err
+}
+
+func (s *Store) DeleteProjectMember(projectID, userID string) error {
+	_, err := s.exec(`DELETE FROM project_members WHERE project_id = ? AND (user_id = ? OR id = ?)`, projectID, userID, userID)
+	return err
+}
+
+// ResolveProjectPermissions calcule les permissions effectives d'un utilisateur sur un projet donné.
+func (s *Store) ResolveProjectPermissions(u *models.User, proj *models.Project) models.ProjectMember {
+	if u == nil || !u.IsActive || proj == nil {
+		return models.PresetPermissionsForRole(models.ProjectRoleViewer)
+	}
+
+	// 1. Les SuperAdmins / Admins SaaS ou le Maître principal du projet (OwnerUserID) ont tous les droits
+	if u.Role == models.RoleSuperAdmin || u.Role == models.RoleAdmin || (proj.OwnerUserID != "" && proj.OwnerUserID == u.ID) {
+		perm := models.PresetPermissionsForRole(models.ProjectRoleOwner)
+		perm.ProjectID = proj.ID
+		perm.UserID = u.ID
+		perm.UserEmail = u.Email
+		perm.UserName = u.DisplayName
+		return perm
+	}
+
+	// 2. Recherche d'une affectation explicite dans project_members (par user_id ou user_email)
+	members, _ := s.GetProjectMembers(proj.ID)
+	for _, m := range members {
+		if m.UserID == u.ID || (m.UserEmail != "" && strings.EqualFold(m.UserEmail, u.Email)) {
+			return m
+		}
+	}
+
+	// 3. Repli selon le rôle global de l'utilisateur dans le Workspace
+	var fallback models.ProjectMember
+	switch u.Role {
+	case models.RoleManager:
+		fallback = models.PresetPermissionsForRole(models.ProjectRoleManager)
+	case models.RoleMember:
+		// Si le projet a déjà des membres explicites et que ce collaborateur n'en fait pas partie,
+		// on lui donne par défaut les droits de Contributeur s'il n'y a aucun membre configuré, ou Lecteur sinon.
+		if len(members) == 0 {
+			fallback = models.PresetPermissionsForRole(models.ProjectRoleContributor)
+		} else {
+			fallback = models.PresetPermissionsForRole(models.ProjectRoleViewer)
+		}
+	default:
+		fallback = models.PresetPermissionsForRole(models.ProjectRoleViewer)
+	}
+	fallback.ProjectID = proj.ID
+	fallback.UserID = u.ID
+	fallback.UserEmail = u.Email
+	fallback.UserName = u.DisplayName
+	return fallback
+}
+
+// Helpers de résolution d'ID de projet à partir d'une entité enfant (WBS, Dépendance, Page Wiki)
+func (s *Store) GetProjectIDByWBSNode(nodeID string) string {
+	var pid string
+	_ = s.queryRow(`SELECT project_id FROM wbs_nodes WHERE id = ?`, nodeID).Scan(&pid)
+	return pid
+}
+
+func (s *Store) GetProjectIDByDependency(depID string) string {
+	var pid string
+	_ = s.queryRow(`SELECT project_id FROM wbs_dependencies WHERE id = ?`, depID).Scan(&pid)
+	return pid
+}
+
+func (s *Store) GetProjectIDByDocPage(docID string) string {
+	var pid string
+	_ = s.queryRow(`SELECT project_id FROM doc_pages WHERE id = ?`, docID).Scan(&pid)
+	return pid
 }
 
 // --- WBS / Gantt ---

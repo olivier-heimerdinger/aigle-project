@@ -1,17 +1,27 @@
 // Package models définit les structures de données du serveur SaaS Aigle.
 // Il intègre l'isolation Multi-Tenant (Workspaces), la gestion des utilisateurs et rôles RBAC,
-// le journal d'audit de sécurité (AuditLog) et les entités métier (Projets, WBS/Gantt, Tickets, Finances, Wiki).
+// les permissions fines par projet (Maître du projet, Contributeur, Exécutant, Lecteur),
+// la protection 2FA TOTP par projet, le journal d'audit de sécurité (AuditLog) et les entités métier.
 package models
 
 import "time"
 
-// Rôles RBAC (Role-Based Access Control) disponibles sur la plateforme SaaS.
+// Rôles RBAC globaux disponibles sur la plateforme SaaS.
 const (
 	RoleSuperAdmin = "superadmin" // Administrateur global de la plateforme (accès Console Admin + tous les tenants)
 	RoleAdmin      = "admin"      // Administrateur d'un Workspace/Tenant
 	RoleManager    = "manager"    // Chef de projet (peut créer/modifier projets, budgets, planning et tickets)
 	RoleMember     = "member"     // Collaborateur (peut créer/déplacer des tickets, pointer des heures, éditer le wiki)
 	RoleViewer     = "viewer"     // Lecture seule (client externe ou observateur)
+)
+
+// Rôles prédéfinis au niveau d'un Projet (avec permissions granulaires ajustables).
+const (
+	ProjectRoleOwner       = "owner"       // Maître du Projet (Owner) : contrôle total + gestion des droits + 2FA
+	ProjectRoleManager     = "manager"     // Chef de Projet : gestion complète du planning, tickets, budget et membres
+	ProjectRoleContributor = "contributor" // Contributeur : lecture, création/édition de tickets, exécution, Gantt, Wiki
+	ProjectRoleExecutor    = "executor"    // Exécutant : lecture + exécution (déplacer les tickets Kanban, pointer des heures, RAF)
+	ProjectRoleViewer      = "viewer"      // Lecteur : consultation seule
 )
 
 // Workspace représente un espace client isolé (Multi-Tenant) dans le SaaS.
@@ -35,16 +45,95 @@ type Workspace struct {
 
 // User représente un compte utilisateur authentifié via Authelia (SSO ForwardAuth) ou créé par l'administrateur.
 type User struct {
-	ID            string    `json:"id"`
-	Username      string    `json:"username"`       // Identifiant Authelia (Remote-User)
-	Email         string    `json:"email"`          // Email Authelia (Remote-Email)
-	DisplayName   string    `json:"display_name"`   // Nom complet (Remote-Name)
-	Role          string    `json:"role"`           // "superadmin", "admin", "manager", "member", "viewer"
-	Groups        string    `json:"groups"`         // Groupes Authelia bruts (Remote-Groups)
-	WorkspaceID   string    `json:"workspace_id"`   // Workspace principal assigné
-	IsActive      bool      `json:"is_active"`      // Permet de bloquer un utilisateur immédiatement dans Aigle
-	LastLoginAt   time.Time `json:"last_login_at"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID             string    `json:"id"`
+	Username       string    `json:"username"`        // Identifiant Authelia (Remote-User)
+	Email          string    `json:"email"`           // Email Authelia (Remote-Email)
+	DisplayName    string    `json:"display_name"`    // Nom complet (Remote-Name)
+	Role           string    `json:"role"`            // "superadmin", "admin", "manager", "member", "viewer"
+	Groups         string    `json:"groups"`          // Groupes Authelia bruts (Remote-Groups)
+	WorkspaceID    string    `json:"workspace_id"`    // Workspace principal assigné
+	IsActive       bool      `json:"is_active"`       // Permet de bloquer un utilisateur immédiatement dans Aigle
+	TOTPEnabled    bool      `json:"totp_enabled"`    // Indique si l'utilisateur a activé son 2FA TOTP
+	TOTPVerifiedAt time.Time `json:"totp_verified_at"`// Horodatage de la dernière validation 2FA TOTP réussie
+	LastLoginAt    time.Time `json:"last_login_at"`
+	CreatedAt      time.Time `json:"created_at"`
+
+	// Champs internes jamais sérialisés en JSON vers le client
+	PasswordHash string `json:"-"`
+	TOTPSecret   string `json:"-"`
+}
+
+// ProjectMember associe un utilisateur à un projet avec un rôle prédéfini et 8 permissions fines.
+type ProjectMember struct {
+	ID               string    `json:"id"`
+	ProjectID        string    `json:"project_id"`
+	UserID           string    `json:"user_id"`
+	UserEmail        string    `json:"user_email"`
+	UserName         string    `json:"user_name"`
+	ProjectRole      string    `json:"project_role"`       // "owner", "manager", "contributor", "executor", "viewer"
+	CanRead          bool      `json:"can_read"`           // Droit de lecture du projet
+	CanWriteTickets  bool      `json:"can_write_tickets"`  // Créer et modifier des tickets / sous-tickets
+	CanDeleteTickets bool      `json:"can_delete_tickets"` // Supprimer des tickets
+	CanExecute       bool      `json:"can_execute"`        // Exécution : déplacer les tickets Kanban, pointer des heures, ajuster le RAF
+	CanEditGantt     bool      `json:"can_edit_gantt"`     // Modifier le planning MS Project (WBS & dépendances)
+	CanEditWiki      bool      `json:"can_edit_wiki"`      // Créer / éditer / supprimer des pages Wiki
+	CanViewFinance   bool      `json:"can_view_finance"`   // Consulter et gérer l'environnement financier (EVM, budgets, TJM)
+	CanManageMembers bool      `json:"can_manage_members"` // Gérer les maîtres du projet, les membres, leurs droits et la 2FA du projet
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// PresetPermissionsForRole retourne les permissions par défaut correspondant à un rôle projet prédéfini.
+func PresetPermissionsForRole(role string) ProjectMember {
+	switch role {
+	case ProjectRoleOwner, ProjectRoleManager:
+		return ProjectMember{
+			ProjectRole:      role,
+			CanRead:          true,
+			CanWriteTickets:  true,
+			CanDeleteTickets: true,
+			CanExecute:       true,
+			CanEditGantt:     true,
+			CanEditWiki:      true,
+			CanViewFinance:   true,
+			CanManageMembers: true,
+		}
+	case ProjectRoleContributor:
+		return ProjectMember{
+			ProjectRole:      ProjectRoleContributor,
+			CanRead:          true,
+			CanWriteTickets:  true,
+			CanDeleteTickets: false,
+			CanExecute:       true,
+			CanEditGantt:     true,
+			CanEditWiki:      true,
+			CanViewFinance:   true,
+			CanManageMembers: false,
+		}
+	case ProjectRoleExecutor:
+		return ProjectMember{
+			ProjectRole:      ProjectRoleExecutor,
+			CanRead:          true,
+			CanWriteTickets:  false,
+			CanDeleteTickets: false,
+			CanExecute:       true,
+			CanEditGantt:     false,
+			CanEditWiki:      false,
+			CanViewFinance:   false,
+			CanManageMembers: false,
+		}
+	default: // ProjectRoleViewer
+		return ProjectMember{
+			ProjectRole:      ProjectRoleViewer,
+			CanRead:          true,
+			CanWriteTickets:  false,
+			CanDeleteTickets: false,
+			CanExecute:       false,
+			CanEditGantt:     false,
+			CanEditWiki:      false,
+			CanViewFinance:   false,
+			CanManageMembers: false,
+		}
+	}
 }
 
 // AuditLog enregistre de manière immuable chaque action sensible ou administrative pour la conformité et la sécurité.
@@ -53,7 +142,7 @@ type AuditLog struct {
 	WorkspaceID string    `json:"workspace_id"`
 	UserEmail   string    `json:"user_email"`
 	UserRole    string    `json:"user_role"`
-	Action      string    `json:"action"`      // ex: "PROJECT_CREATE", "ADMIN_WORKSPACE_UPDATE", "USER_ROLE_CHANGE", "TICKET_DELETE"
+	Action      string    `json:"action"`      // ex: "PROJECT_CREATE", "PASSWORD_CHANGE", "PROJECT_TOTP_VERIFY", "PROJECT_MEMBER_SAVE"
 	TargetType  string    `json:"target_type"` // "workspace", "user", "project", "wbs", "ticket", "doc"
 	TargetID    string    `json:"target_id"`
 	Details     string    `json:"details"`
@@ -65,6 +154,7 @@ type AuditLog struct {
 type SystemOverview struct {
 	AppVersion      string      `json:"app_version"`
 	AuthMode        string      `json:"auth_mode"`
+	PasswordMode    string      `json:"password_mode"`
 	DBDriver        string      `json:"db_driver"`
 	AppDomain       string      `json:"app_domain"`
 	AuthDomain      string      `json:"auth_domain"`
@@ -92,7 +182,7 @@ type Member struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Project représente un projet rattaché à un Workspace avec son budget et sa timeline.
+// Project représente un projet rattaché à un Workspace avec son budget, sa timeline, ses maîtres/membres et sa politique 2FA TOTP.
 type Project struct {
 	ID                string    `json:"id"`
 	WorkspaceID       string    `json:"workspace_id"`
@@ -106,10 +196,15 @@ type Project struct {
 	InitialBudget     float64   `json:"initial_budget"`
 	DefaultHourlyRate float64   `json:"default_hourly_rate"`
 	Currency          string    `json:"currency"`
+	OwnerUserID       string    `json:"owner_user_id"` // ID de l'utilisateur Maître principal du projet
+	OwnerName         string    `json:"owner_name,omitempty"`
+	RequireTOTP       bool      `json:"require_totp"`  // Si true, exige la validation 2FA TOTP (Authelia + Aigle) pour accéder au projet
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 
-	Financials *FinancialSummary `json:"financials,omitempty"`
+	Financials     *FinancialSummary `json:"financials,omitempty"`
+	ProjectMembers []ProjectMember   `json:"project_members,omitempty"`
+	MyPermissions  *ProjectMember    `json:"my_permissions,omitempty"`
 }
 
 // WBSNode représente une Phase, Tâche ou Jalon dans le planning MS Project / Gantt.
@@ -245,4 +340,3 @@ type DocPage struct {
 	OrderIndex      int       `json:"order_index"`
 	UpdatedAt       time.Time `json:"updated_at"`
 }
-

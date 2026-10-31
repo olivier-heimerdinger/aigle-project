@@ -1,5 +1,6 @@
 // Client API HTTP pour Aigle Server (Édition SaaS Multi-Tenant & Authelia SSO).
-// Gère automatiquement l'en-tête X-Workspace-ID pour l'isolation Multi-Tenant.
+// Gère automatiquement l'en-tête X-Workspace-ID, le compte personnel (Argon2id + 2FA TOTP)
+// et la matrice de permissions granulaires par projet.
 const BASE = '/api';
 
 let currentWorkspaceId = '';
@@ -24,7 +25,11 @@ async function request(method, path, body = undefined) {
   const res = await fetch(`${BASE}${path}`, opts);
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    throw new Error(data.error || `Erreur HTTP ${res.status}`);
+    const err = new Error(data.error || `Erreur HTTP ${res.status}`);
+    err.status = res.status;
+    err.code = data.code || '';
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -33,6 +38,17 @@ export const api = {
   // Santé & Identité SSO Authelia
   getHealth: () => request('GET', '/health'),
   getMe: () => request('GET', '/me'),
+
+  // Gestion du Compte Personnel : Mot de passe Argon2id / Authelia & 2FA TOTP (TODO #1 & #3)
+  getAccount: () => request('GET', '/account'),
+  updateAccountProfile: (payload) => request('PUT', '/account/profile', payload),
+  changePassword: (payload) => request('POST', '/account/password', payload),
+  setupTOTP: () => request('POST', '/account/totp/setup'),
+  activateTOTP: (code) => request('POST', '/account/totp/activate', { code }),
+  disableTOTP: (code) => request('POST', '/account/totp/disable', { code }),
+
+  // Annuaire des utilisateurs du Workspace actif
+  getWorkspaceUsers: () => request('GET', '/workspace/users'),
 
   // Console d'Administration SaaS (/api/admin/...)
   getAdminOverview: () => request('GET', '/admin/overview'),
@@ -44,12 +60,17 @@ export const api = {
   updateAdminUser: (id, u) => request('PUT', `/admin/users/${id}`, u),
   getAdminAuditLogs: () => request('GET', '/admin/audit-logs'),
 
-  // Portefeuille Projets Multi-Tenant
+  // Portefeuille Projets Multi-Tenant, Maîtres de Projet, Droits Fins & 2FA Projet (TODO #2 & #3)
   getProjects: () => request('GET', '/projects'),
   createProject: (p) => request('POST', '/projects', p),
   updateProject: (id, p) => request('PUT', `/projects/${id}`, p),
   deleteProject: (id) => request('DELETE', `/projects/${id}`),
   getProjectFull: (id) => request('GET', `/projects/${id}/full`),
+  getProjectMembers: (projectId) => request('GET', `/projects/${projectId}/members`),
+  saveProjectMember: (projectId, member) => request('POST', `/projects/${projectId}/members`, member),
+  deleteProjectMember: (projectId, userId) => request('DELETE', `/projects/${projectId}/members/${userId}`),
+  updateProjectSecurity: (projectId, sec) => request('PUT', `/projects/${projectId}/security`, sec),
+  verifyProjectTOTP: (projectId, code) => request('POST', `/projects/${projectId}/verify-totp`, { code }),
 
   // Intervenants & TJM (Members)
   getMembers: () => request('GET', '/members'),
@@ -99,6 +120,84 @@ export const ROLE_BADGES = {
   viewer: { label: 'Lecture Seule', class: 'bg-slate-500/20 text-slate-300 border-slate-500/40' },
 };
 
+export const PROJECT_ROLE_PRESETS = {
+  owner: {
+    label: '👑 Maître du Projet (Owner)',
+    badge: 'bg-amber-500/20 text-amber-300 border-amber-500/40',
+    desc: 'Contrôle total sur le projet, ses membres, leurs droits fins et la politique 2FA TOTP.',
+    perms: {
+      can_read: true,
+      can_write_tickets: true,
+      can_delete_tickets: true,
+      can_execute: true,
+      can_edit_gantt: true,
+      can_edit_wiki: true,
+      can_view_finance: true,
+      can_manage_members: true,
+    },
+  },
+  manager: {
+    label: '🎯 Chef de Projet',
+    badge: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40',
+    desc: 'Pilote le planning Gantt, le budget, les tickets et les membres du projet.',
+    perms: {
+      can_read: true,
+      can_write_tickets: true,
+      can_delete_tickets: true,
+      can_execute: true,
+      can_edit_gantt: true,
+      can_edit_wiki: true,
+      can_view_finance: true,
+      can_manage_members: true,
+    },
+  },
+  contributor: {
+    label: '🛠️ Contributeur',
+    badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40',
+    desc: 'Crée/modifie les tickets, exécute et pointe ses heures, édite le Gantt et le Wiki.',
+    perms: {
+      can_read: true,
+      can_write_tickets: true,
+      can_delete_tickets: false,
+      can_execute: true,
+      can_edit_gantt: true,
+      can_edit_wiki: true,
+      can_view_finance: true,
+      can_manage_members: false,
+    },
+  },
+  executor: {
+    label: '⚡ Exécutant (Opérateur)',
+    badge: 'bg-sky-500/20 text-sky-300 border-sky-500/40',
+    desc: 'Consulte le projet, déplace les tickets Kanban et pointe ses heures (sans modifier la structure).',
+    perms: {
+      can_read: true,
+      can_write_tickets: false,
+      can_delete_tickets: false,
+      can_execute: true,
+      can_edit_gantt: false,
+      can_edit_wiki: false,
+      can_view_finance: false,
+      can_manage_members: false,
+    },
+  },
+  viewer: {
+    label: '👁️ Lecteur (Observateur)',
+    badge: 'bg-slate-500/20 text-slate-300 border-slate-500/40',
+    desc: 'Consultation en lecture seule (aucune écriture, aucun déplacement ni pointage).',
+    perms: {
+      can_read: true,
+      can_write_tickets: false,
+      can_delete_tickets: false,
+      can_execute: false,
+      can_edit_gantt: false,
+      can_edit_wiki: false,
+      can_view_finance: false,
+      can_manage_members: false,
+    },
+  },
+};
+
 export const TICKET_TYPES = {
   task: { label: 'Tâche', badge: 'bg-sky-500/15 text-sky-300 border-sky-500/30', icon: '⚡' },
   feature: { label: 'Évolution', badge: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30', icon: '✨' },
@@ -121,4 +220,3 @@ export const KANBAN_COLUMNS = [
   { id: 'review', label: 'En revue / QA', color: 'border-amber-500/30 bg-slate-900/60', dot: 'bg-amber-400' },
   { id: 'done', label: 'Terminé', color: 'border-emerald-500/30 bg-emerald-950/15', dot: 'bg-emerald-400' },
 ];
-

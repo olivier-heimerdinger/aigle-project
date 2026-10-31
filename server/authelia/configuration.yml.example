@@ -50,7 +50,7 @@ session:
   remember_me: '7d'
   cookies:
     - domain: 'heimerdinger.studio'
-      authelia_url: 'https://airgle-auth.heimerdinger.studio'
+      authelia_url: 'https://aigle-auth.heimerdinger.studio'
       default_redirection_url: 'https://aigle.heimerdinger.studio/app'
   redis:
     host: 'aigle-authelia-redis'

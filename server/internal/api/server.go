@@ -1,7 +1,9 @@
 // Package api implémente le serveur HTTP REST et SSE (Server-Sent Events) d'Aigle Server (Édition SaaS).
 // Il assure :
 //   - La validation Zero-Trust de l'identité SSO Authelia transmise par Traefik (ForwardAuth)
-//   - Le contrôle d'accès basé sur les rôles (RBAC : superadmin, admin, manager, member, viewer)
+//   - Le contrôle d'accès basé sur les rôles globaux (RBAC) ET les permissions fines par projet (Maître, Chef, Contributeur, Exécutant, Lecteur)
+//   - La gestion du compte personnel (changement de mot de passe Argon2id direct + portail Authelia SMTP)
+//   - La double authentification 2FA TOTP par projet (synchronisation Authelia two_factor + vérification RFC 6238 en session)
 //   - L'isolation stricte des espaces de travail Multi-Tenant (Workspaces)
 //   - La Console et l'API d'Administration SaaS (/api/admin/...)
 //   - La journalisation immuable des événements de sécurité (audit_logs)
@@ -16,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aigle/aigle-server/internal/authelia"
 	"github.com/aigle/aigle-server/internal/config"
 	"github.com/aigle/aigle-server/internal/database"
 	"github.com/aigle/aigle-server/internal/engine"
@@ -62,6 +65,17 @@ func NewServer(store *database.Store, cfg *config.ServerConfig, webFS fs.FS) htt
 	// --- Profil SSO Authelia & Contexte Multi-Tenant (Zone Protégée) ---
 	mux.HandleFunc("GET /api/me", s.withAuth(s.handleGetMe))
 
+	// --- Gestion du Compte Personnel : Mot de passe Argon2id / Authelia & Enrôlement 2FA TOTP (TODO #1 & #3) ---
+	mux.HandleFunc("GET /api/account", s.withAuth(s.handleGetAccount))
+	mux.HandleFunc("PUT /api/account/profile", s.withAuth(s.handleUpdateAccountProfile))
+	mux.HandleFunc("POST /api/account/password", s.withAuth(s.handleChangePassword))
+	mux.HandleFunc("POST /api/account/totp/setup", s.withAuth(s.handleSetupTOTP))
+	mux.HandleFunc("POST /api/account/totp/activate", s.withAuth(s.handleActivateTOTP))
+	mux.HandleFunc("POST /api/account/totp/disable", s.withAuth(s.handleDisableTOTP))
+
+	// --- Annuaire Utilisateurs du Workspace (pour sélection des Maîtres de projet & Membres) ---
+	mux.HandleFunc("GET /api/workspace/users", s.withAuth(s.handleGetWorkspaceUsers))
+
 	// --- Console d'Administration SaaS (/api/admin/...) réservée aux SuperAdmins / Admins ---
 	mux.HandleFunc("GET /api/admin/overview", s.withAuth(s.handleAdminOverview))
 	mux.HandleFunc("GET /api/admin/workspaces", s.withAuth(s.handleAdminGetWorkspaces))
@@ -75,12 +89,17 @@ func NewServer(store *database.Store, cfg *config.ServerConfig, webFS fs.FS) htt
 	// --- Flux temps réel SSE (Server-Sent Events) isolé par Workspace ---
 	mux.HandleFunc("GET /api/events", s.withAuth(s.handleSSE))
 
-	// --- Projets Multi-Tenant ---
+	// --- Projets Multi-Tenant, Maîtres de Projet, Permissions Fines & 2FA TOTP Projet (TODO #2 & #3) ---
 	mux.HandleFunc("GET /api/projects", s.withAuth(s.handleGetProjects))
 	mux.HandleFunc("POST /api/projects", s.withAuth(s.handleCreateProject))
 	mux.HandleFunc("PUT /api/projects/{id}", s.withAuth(s.handleUpdateProject))
 	mux.HandleFunc("DELETE /api/projects/{id}", s.withAuth(s.handleDeleteProject))
 	mux.HandleFunc("GET /api/projects/{id}/full", s.withAuth(s.handleGetProjectFull))
+	mux.HandleFunc("GET /api/projects/{id}/members", s.withAuth(s.handleGetProjectMembers))
+	mux.HandleFunc("POST /api/projects/{id}/members", s.withAuth(s.handleSaveProjectMember))
+	mux.HandleFunc("DELETE /api/projects/{id}/members/{userId}", s.withAuth(s.handleDeleteProjectMember))
+	mux.HandleFunc("PUT /api/projects/{id}/security", s.withAuth(s.handleUpdateProjectSecurity))
+	mux.HandleFunc("POST /api/projects/{id}/verify-totp", s.withAuth(s.handleVerifyProjectTOTP))
 
 	// --- Intervenants & TJM (Members) ---
 	mux.HandleFunc("GET /api/members", s.withAuth(s.handleGetMembers))
@@ -133,6 +152,9 @@ func NewServer(store *database.Store, cfg *config.ServerConfig, webFS fs.FS) htt
 			fmt.Fprint(w, "<h1>Aigle Public Portal & Downloads Active</h1>")
 		})
 	}
+
+	// Synchronisation initiale des règles two_factor Authelia au démarrage
+	s.syncAutheliaTwoFactorProjects()
 
 	// Chaîne de sécurité (SecurityHeaders -> RateLimiter -> BodySizeLimit -> Mux)
 	var handler http.Handler = mux
@@ -249,13 +271,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "ok",
-		"app":         "Aigle SaaS Server",
-		"mode":        "saas",
-		"auth_mode":   s.Cfg.AuthMode,
-		"db_driver":   s.Store.Driver,
-		"app_domain":  s.Cfg.AppDomain,
-		"auth_domain": s.Cfg.AuthDomain,
+		"status":        "ok",
+		"app":           "Aigle SaaS Server",
+		"mode":          "saas",
+		"auth_mode":     s.Cfg.AuthMode,
+		"password_mode": s.Cfg.PasswordMode,
+		"db_driver":     s.Store.Driver,
+		"app_domain":    s.Cfg.AppDomain,
+		"auth_domain":   s.Cfg.AuthDomain,
 	})
 }
 
@@ -280,16 +303,20 @@ func (s *Server) handleGetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user":               u,
-		"active_workspace":   activeWS,
-		"workspaces":         accessible,
-		"can_write":          middleware.CanWrite(u),
-		"can_manage_project": middleware.CanManageProject(u),
-		"is_admin":           middleware.IsSuperAdmin(u),
-		"auth_mode":          s.Cfg.AuthMode,
-		"app_domain":         s.Cfg.AppDomain,
-		"auth_domain":        s.Cfg.AuthDomain,
-		"logout_url":         fmt.Sprintf("https://%s/logout", s.Cfg.AuthDomain),
+		"user":                   u,
+		"active_workspace":       activeWS,
+		"workspaces":             accessible,
+		"can_write":              middleware.CanWrite(u),
+		"can_manage_project":     middleware.CanManageProject(u),
+		"is_admin":               middleware.IsSuperAdmin(u),
+		"totp_enabled":           u.TOTPEnabled,
+		"totp_verified_session":  s.isTOTPVerifiedForSession(u),
+		"password_mode":          s.Cfg.PasswordMode,
+		"auth_mode":              s.Cfg.AuthMode,
+		"app_domain":             s.Cfg.AppDomain,
+		"auth_domain":            s.Cfg.AuthDomain,
+		"authelia_settings_url":  fmt.Sprintf("https://%s/settings", s.Cfg.AuthDomain),
+		"logout_url":             fmt.Sprintf("https://%s/logout", s.Cfg.AuthDomain),
 	})
 }
 
@@ -380,8 +407,9 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	overview := models.SystemOverview{
-		AppVersion:      "2.0.0-saas",
+		AppVersion:      "2.1.0-saas",
 		AuthMode:        s.Cfg.AuthMode,
+		PasswordMode:    s.Cfg.PasswordMode,
 		DBDriver:        s.Store.Driver,
 		AppDomain:       s.Cfg.AppDomain,
 		AuthDomain:      s.Cfg.AuthDomain,
@@ -468,11 +496,15 @@ func (s *Server) handleAdminSaveUser(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireAdmin(w, r); !ok {
 		return
 	}
-	var u models.User
-	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+	var payload struct {
+		models.User
+		InitialPassword string `json:"initial_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	u := payload.User
 	if strings.TrimSpace(u.Email) == "" {
 		writeErr(w, http.StatusBadRequest, "L'adresse email est obligatoire")
 		return
@@ -487,6 +519,14 @@ func (s *Server) handleAdminSaveUser(w http.ResponseWriter, r *http.Request) {
 		u.Role = models.RoleMember
 	}
 	u.IsActive = true
+
+	if strings.TrimSpace(payload.InitialPassword) != "" {
+		if hash, err := authelia.HashPasswordArgon2id(payload.InitialPassword); err == nil {
+			u.PasswordHash = hash
+			_ = authelia.UpdateUserPasswordInFile(s.Cfg.AutheliaUsersFile, u.Username, u.Email, u.DisplayName, u.Role, hash)
+		}
+	}
+
 	if err := s.Store.SaveUser(&u); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -500,15 +540,25 @@ func (s *Server) handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var u models.User
-	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+	var payload struct {
+		models.User
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	u := payload.User
 	u.ID = id
 	if err := s.Store.SaveUser(&u); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if strings.TrimSpace(payload.NewPassword) != "" {
+		if hash, err := authelia.HashPasswordArgon2id(payload.NewPassword); err == nil {
+			_ = s.Store.UpdateUserPasswordHash(u.ID, hash)
+			_ = authelia.UpdateUserPasswordInFile(s.Cfg.AutheliaUsersFile, u.Username, u.Email, u.DisplayName, u.Role, hash)
+		}
 	}
 	s.audit(r, "ADMIN_USER_UPDATE", "user", u.ID, fmt.Sprintf("Modification RBAC utilisateur %s : rôle=%s, workspace=%s, actif=%v", u.Email, u.Role, u.WorkspaceID, u.IsActive))
 	writeJSON(w, http.StatusOK, u)
@@ -527,7 +577,7 @@ func (s *Server) handleAdminGetAuditLogs(w http.ResponseWriter, r *http.Request)
 }
 
 // ============================================================================
-// PROJETS, MEMBRES, WBS/GANTT, KANBAN & WIKI (ISOLÉS PAR WORKSPACE)
+// PROJETS, MEMBRES, WBS/GANTT, KANBAN & WIKI (ISOLÉS PAR WORKSPACE & DROITS PROJET)
 // ============================================================================
 
 func (s *Server) handleGetProjects(w http.ResponseWriter, r *http.Request) {
@@ -538,15 +588,25 @@ func (s *Server) handleGetProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	members, _ := s.Store.GetMembers(u.WorkspaceID)
+	var visible []*models.Project
 	for _, p := range projects {
+		perm := s.Store.ResolveProjectPermissions(u, p)
+		if !perm.CanRead {
+			continue
+		}
+		p.MyPermissions = &perm
 		nodes, _ := s.Store.GetWBSNodes(p.ID)
 		deps, _ := s.Store.GetWBSDependencies(p.ID)
 		tickets, _ := s.Store.GetTickets(p.ID)
 		logs, _ := s.Store.GetTimeLogsByProject(p.ID)
 		_ = engine.ComputeSchedule(nodes, deps)
 		engine.ComputeProjectFinancials(p, nodes, tickets, members, logs)
+		visible = append(visible, p)
 	}
-	writeJSON(w, http.StatusOK, projects)
+	if visible == nil {
+		visible = []*models.Project{}
+	}
+	writeJSON(w, http.StatusOK, visible)
 }
 
 func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
@@ -561,68 +621,101 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.WorkspaceID = u.WorkspaceID
+	if p.OwnerUserID == "" {
+		p.OwnerUserID = u.ID
+	}
+
+	// Si RequireTOTP est activé dès la création, on s'assure que le créateur a activé son TOTP
+	if p.RequireTOTP {
+		freshUser, _ := s.Store.GetUserByID(u.ID)
+		if freshUser == nil || !freshUser.TOTPEnabled {
+			writeErr(w, http.StatusBadRequest, "Pour créer un projet avec 2FA TOTP obligatoire, veuillez d'abord activer votre propre 2FA TOTP dans « 👤 Mon Compte ».")
+			return
+		}
+		_ = s.Store.MarkUserTOTPVerified(u.ID, time.Now())
+	}
+
 	if err := s.Store.CreateProject(&p); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.audit(r, "PROJECT_CREATE", "project", p.ID, fmt.Sprintf("Création du projet %s (%s) dans %s", p.Code, p.Name, p.WorkspaceID))
+
+	// Garantit que le créateur est également inscrit comme Maître du Projet ('owner') s'il a délégué OwnerUserID à un autre utilisateur
+	if p.OwnerUserID != u.ID {
+		creatorOwner := models.PresetPermissionsForRole(models.ProjectRoleOwner)
+		creatorOwner.ProjectID = p.ID
+		creatorOwner.UserID = u.ID
+		creatorOwner.UserEmail = u.Email
+		creatorOwner.UserName = u.DisplayName
+		_ = s.Store.SaveProjectMember(&creatorOwner)
+	}
+
+	if p.RequireTOTP {
+		s.syncAutheliaTwoFactorProjects()
+	}
+
+	s.audit(r, "PROJECT_CREATE", "project", p.ID, fmt.Sprintf("Création du projet %s (%s) dans %s (Maître=%s, 2FA=%v)", p.Code, p.Name, p.WorkspaceID, p.OwnerUserID, p.RequireTOTP))
 	s.broadcastChange(u.WorkspaceID, "project_created", p.ID)
 	writeJSON(w, http.StatusCreated, p)
 }
 
 func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanManageProject(u) {
+	id := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, id)
+	if !ok {
+		return
+	}
+	if !perm.CanManageMembers && !perm.CanViewFinance {
 		writeErr(w, http.StatusForbidden, "Privilèges insuffisants pour modifier la configuration du projet.")
 		return
 	}
-	id := r.PathValue("id")
 	var p models.Project
 	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	p.ID = id
-	p.WorkspaceID = u.WorkspaceID
+	p.WorkspaceID = proj.WorkspaceID
+	if p.OwnerUserID == "" {
+		p.OwnerUserID = proj.OwnerUserID
+	}
 	if err := s.Store.UpdateProject(&p); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.audit(r, "PROJECT_UPDATE", "project", p.ID, fmt.Sprintf("Modification du projet %s (Budget=%.0f)", p.Code, p.InitialBudget))
-	s.broadcastChange(u.WorkspaceID, "project_updated", p.ID)
+	s.syncAutheliaTwoFactorProjects()
+	s.audit(r, "PROJECT_UPDATE", "project", p.ID, fmt.Sprintf("Modification du projet %s (Budget=%.0f, 2FA=%v)", p.Code, p.InitialBudget, p.RequireTOTP))
+	s.broadcastChange(proj.WorkspaceID, "project_updated", p.ID)
 	writeJSON(w, http.StatusOK, p)
 }
 
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanManageProject(u) {
-		writeErr(w, http.StatusForbidden, "Privilèges insuffisants pour supprimer un projet.")
+	id := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, id)
+	if !ok {
 		return
 	}
-	id := r.PathValue("id")
+	if !perm.CanManageMembers {
+		writeErr(w, http.StatusForbidden, "Privilèges insuffisants : seul un Maître du Projet ou un Administrateur peut supprimer ce projet.")
+		return
+	}
 	if err := s.Store.DeleteProject(id); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.syncAutheliaTwoFactorProjects()
 	s.audit(r, "PROJECT_DELETE", "project", id, "Suppression complète du projet")
-	s.broadcastChange(u.WorkspaceID, "project_deleted", id)
+	s.broadcastChange(proj.WorkspaceID, "project_deleted", id)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
 func (s *Server) handleGetProjectFull(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
 	id := r.PathValue("id")
-	proj, err := s.Store.GetProject(id)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, "Projet introuvable")
+	proj, perm, ok := s.checkProjectAccess(w, r, id)
+	if !ok {
 		return
 	}
-	// Isolation Multi-Tenant : interdiction de lire un projet appartenant à un autre Workspace
-	if proj.WorkspaceID != u.WorkspaceID && !middleware.IsSuperAdmin(u) {
-		s.audit(r, "CROSS_TENANT_BLOCKED", "project", id, fmt.Sprintf("Tentative d'accès hors Workspace (%s -> %s)", u.WorkspaceID, proj.WorkspaceID))
-		writeErr(w, http.StatusForbidden, "Accès refusé : ce projet appartient à un autre espace client (Workspace).")
-		return
-	}
+	proj.MyPermissions = &perm
 
 	nodes, err := s.Store.GetWBSNodes(id)
 	if err != nil {
@@ -654,19 +747,22 @@ func (s *Server) handleGetProjectFull(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	projectMembers, _ := s.Store.GetProjectMembers(id)
 
 	scheduleErr := engine.ComputeSchedule(nodes, deps)
 	finSummary := engine.ComputeProjectFinancials(proj, nodes, tickets, members, logs)
 
 	resp := map[string]any{
-		"project":      proj,
-		"financials":   finSummary,
-		"wbs_nodes":    nodes,
-		"dependencies": deps,
-		"tickets":      tickets,
-		"time_logs":    logs,
-		"docs":         docs,
-		"members":      members,
+		"project":         proj,
+		"my_permissions":  perm,
+		"project_members": projectMembers,
+		"financials":      finSummary,
+		"wbs_nodes":       nodes,
+		"dependencies":    deps,
+		"tickets":         tickets,
+		"time_logs":       logs,
+		"docs":            docs,
+		"members":         members,
 	}
 	if scheduleErr != nil {
 		resp["schedule_warning"] = scheduleErr.Error()
@@ -729,12 +825,15 @@ func (s *Server) handleUpdateMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateWBSNode(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule (rôle 'viewer') : modification du planning non autorisée.")
+	projectID := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
 		return
 	}
-	projectID := r.PathValue("id")
+	if !perm.CanEditGantt {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Planning Gantt (WBS) » est requise sur ce projet.")
+		return
+	}
 	var n models.WBSNode
 	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -745,53 +844,73 @@ func (s *Server) handleCreateWBSNode(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "wbs_created", projectID)
+	s.broadcastChange(proj.WorkspaceID, "wbs_created", projectID)
 	writeJSON(w, http.StatusCreated, n)
 }
 
 func (s *Server) handleUpdateWBSNode(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : modification du planning non autorisée.")
+	nodeID := r.PathValue("nodeId")
+	projectID := s.Store.GetProjectIDByWBSNode(nodeID)
+	if projectID == "" {
+		writeErr(w, http.StatusNotFound, "Tâche WBS introuvable")
 		return
 	}
-	nodeID := r.PathValue("nodeId")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
+		return
+	}
+	if !perm.CanEditGantt {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Planning Gantt (WBS) » est requise sur ce projet.")
+		return
+	}
 	var n models.WBSNode
 	if err := json.NewDecoder(r.Body).Decode(&n); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	n.ID = nodeID
+	n.ProjectID = projectID
 	if err := s.Store.SaveWBSNode(&n); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "wbs_updated", n.ProjectID)
+	s.broadcastChange(proj.WorkspaceID, "wbs_updated", projectID)
 	writeJSON(w, http.StatusOK, n)
 }
 
 func (s *Server) handleDeleteWBSNode(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : suppression non autorisée.")
+	nodeID := r.PathValue("nodeId")
+	projectID := s.Store.GetProjectIDByWBSNode(nodeID)
+	if projectID == "" {
+		writeErr(w, http.StatusNotFound, "Tâche WBS introuvable")
 		return
 	}
-	nodeID := r.PathValue("nodeId")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
+		return
+	}
+	if !perm.CanEditGantt {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Planning Gantt (WBS) » est requise pour supprimer une tâche.")
+		return
+	}
 	if err := s.Store.DeleteWBSNode(nodeID); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "wbs_deleted", "")
+	s.broadcastChange(proj.WorkspaceID, "wbs_deleted", projectID)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": nodeID})
 }
 
 func (s *Server) handleCreateDependency(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : ajout de dépendance non autorisé.")
+	projectID := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
 		return
 	}
-	projectID := r.PathValue("id")
+	if !perm.CanEditGantt {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Planning Gantt (WBS) » est requise pour lier des tâches.")
+		return
+	}
 	var d models.WBSDependency
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -814,32 +933,43 @@ func (s *Server) handleCreateDependency(w http.ResponseWriter, r *http.Request) 
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "dependency_created", projectID)
+	s.broadcastChange(proj.WorkspaceID, "dependency_created", projectID)
 	writeJSON(w, http.StatusCreated, d)
 }
 
 func (s *Server) handleDeleteDependency(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : suppression de dépendance non autorisée.")
+	depID := r.PathValue("depId")
+	projectID := s.Store.GetProjectIDByDependency(depID)
+	if projectID == "" {
+		writeErr(w, http.StatusNotFound, "Dépendance introuvable")
 		return
 	}
-	depID := r.PathValue("depId")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
+		return
+	}
+	if !perm.CanEditGantt {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Planning Gantt (WBS) » est requise.")
+		return
+	}
 	if err := s.Store.DeleteWBSDependency(depID); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "dependency_deleted", "")
+	s.broadcastChange(proj.WorkspaceID, "dependency_deleted", projectID)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": depID})
 }
 
 func (s *Server) handleCreateTicket(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule (rôle 'viewer') : création de ticket non autorisée.")
+	projectID := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
 		return
 	}
-	projectID := r.PathValue("id")
+	if !perm.CanWriteTickets {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Écriture de Tickets » est requise sur ce projet.")
+		return
+	}
 	var t models.Ticket
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -851,41 +981,53 @@ func (s *Server) handleCreateTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r, "TICKET_CREATE", "ticket", t.ID, fmt.Sprintf("Création du ticket %s : %s", t.TicketKey, t.Title))
-	s.broadcastChange(u.WorkspaceID, "ticket_created", projectID)
+	s.broadcastChange(proj.WorkspaceID, "ticket_created", projectID)
 	writeJSON(w, http.StatusCreated, t)
 }
 
 func (s *Server) handleUpdateTicket(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : modification de ticket non autorisée.")
+	ticketID := r.PathValue("ticketId")
+	existing, err := s.Store.GetTicket(ticketID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "Ticket introuvable")
 		return
 	}
-	ticketID := r.PathValue("ticketId")
+	proj, perm, ok := s.checkProjectAccess(w, r, existing.ProjectID)
+	if !ok {
+		return
+	}
+	if !perm.CanWriteTickets {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Écriture de Tickets » est requise pour modifier un ticket.")
+		return
+	}
 	var t models.Ticket
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	t.ID = ticketID
+	t.ProjectID = existing.ProjectID
 	if err := s.Store.SaveTicket(&t); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "ticket_updated", t.ProjectID)
+	s.broadcastChange(proj.WorkspaceID, "ticket_updated", t.ProjectID)
 	writeJSON(w, http.StatusOK, t)
 }
 
 func (s *Server) handleMoveTicket(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : déplacement de ticket non autorisé.")
-		return
-	}
 	ticketID := r.PathValue("ticketId")
 	existing, err := s.Store.GetTicket(ticketID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Ticket introuvable")
+		return
+	}
+	proj, perm, ok := s.checkProjectAccess(w, r, existing.ProjectID)
+	if !ok {
+		return
+	}
+	if !perm.CanExecute && !perm.CanWriteTickets {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Exécution (Kanban & Pointage) » est requise pour déplacer un ticket.")
 		return
 	}
 
@@ -920,33 +1062,50 @@ func (s *Server) handleMoveTicket(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "ticket_moved", existing.ProjectID)
+	s.broadcastChange(proj.WorkspaceID, "ticket_moved", existing.ProjectID)
 	writeJSON(w, http.StatusOK, existing)
 }
 
 func (s *Server) handleDeleteTicket(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : suppression de ticket non autorisée.")
+	ticketID := r.PathValue("ticketId")
+	existing, err := s.Store.GetTicket(ticketID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "Ticket introuvable")
 		return
 	}
-	ticketID := r.PathValue("ticketId")
+	proj, perm, ok := s.checkProjectAccess(w, r, existing.ProjectID)
+	if !ok {
+		return
+	}
+	if !perm.CanDeleteTickets {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Suppression de Tickets » est requise sur ce projet.")
+		return
+	}
 	if err := s.Store.DeleteTicket(ticketID); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.audit(r, "TICKET_DELETE", "ticket", ticketID, "Suppression d'un ticket")
-	s.broadcastChange(u.WorkspaceID, "ticket_deleted", "")
+	s.broadcastChange(proj.WorkspaceID, "ticket_deleted", existing.ProjectID)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": ticketID})
 }
 
 func (s *Server) handleAddTimeLog(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : pointage d'heures non autorisé.")
+	ticketID := r.PathValue("ticketId")
+	existing, err := s.Store.GetTicket(ticketID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "Ticket introuvable")
 		return
 	}
-	ticketID := r.PathValue("ticketId")
+	proj, perm, ok := s.checkProjectAccess(w, r, existing.ProjectID)
+	if !ok {
+		return
+	}
+	if !perm.CanExecute && !perm.CanWriteTickets {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Exécution (Kanban & Pointage) » est requise pour pointer des heures.")
+		return
+	}
+
 	var payload struct {
 		MemberID          string   `json:"member_id"`
 		Hours             float64  `json:"hours"`
@@ -975,17 +1134,20 @@ func (s *Server) handleAddTimeLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "timelog_added", "")
+	s.broadcastChange(proj.WorkspaceID, "timelog_added", existing.ProjectID)
 	writeJSON(w, http.StatusCreated, logEntry)
 }
 
 func (s *Server) handleCreateDoc(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : création de page Wiki non autorisée.")
+	projectID := r.PathValue("id")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
 		return
 	}
-	projectID := r.PathValue("id")
+	if !perm.CanEditWiki {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Édition Wiki Markdown » est requise sur ce projet.")
+		return
+	}
 	var d models.DocPage
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -996,42 +1158,59 @@ func (s *Server) handleCreateDoc(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "doc_created", projectID)
+	s.broadcastChange(proj.WorkspaceID, "doc_created", projectID)
 	writeJSON(w, http.StatusCreated, d)
 }
 
 func (s *Server) handleUpdateDoc(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : modification de page Wiki non autorisée.")
+	docID := r.PathValue("docId")
+	projectID := s.Store.GetProjectIDByDocPage(docID)
+	if projectID == "" {
+		writeErr(w, http.StatusNotFound, "Page Wiki introuvable")
 		return
 	}
-	docID := r.PathValue("docId")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
+		return
+	}
+	if !perm.CanEditWiki {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Édition Wiki Markdown » est requise sur ce projet.")
+		return
+	}
 	var d models.DocPage
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	d.ID = docID
+	d.ProjectID = projectID
 	if err := s.Store.SaveDocPage(&d); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "doc_updated", d.ProjectID)
+	s.broadcastChange(proj.WorkspaceID, "doc_updated", d.ProjectID)
 	writeJSON(w, http.StatusOK, d)
 }
 
 func (s *Server) handleDeleteDoc(w http.ResponseWriter, r *http.Request) {
-	u := middleware.GetUser(r)
-	if !middleware.CanWrite(u) {
-		writeErr(w, http.StatusForbidden, "Mode lecture seule : suppression de page Wiki non autorisée.")
+	docID := r.PathValue("docId")
+	projectID := s.Store.GetProjectIDByDocPage(docID)
+	if projectID == "" {
+		writeErr(w, http.StatusNotFound, "Page Wiki introuvable")
 		return
 	}
-	docID := r.PathValue("docId")
+	proj, perm, ok := s.checkProjectAccess(w, r, projectID)
+	if !ok {
+		return
+	}
+	if !perm.CanEditWiki {
+		writeErr(w, http.StatusForbidden, "Droit refusé : la permission « Édition Wiki Markdown » est requise pour supprimer une page.")
+		return
+	}
 	if err := s.Store.DeleteDocPage(docID); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.broadcastChange(u.WorkspaceID, "doc_deleted", "")
+	s.broadcastChange(proj.WorkspaceID, "doc_deleted", projectID)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": docID})
 }

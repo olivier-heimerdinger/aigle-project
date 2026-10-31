@@ -1,6 +1,6 @@
 // Package config gère la configuration du serveur SaaS Aigle selon la méthodologie "12-Factor App".
-// Toutes les options sensibles (DSN PostgreSQL, secrets de proxy, domaines, politiques de sécurité)
-// sont injectables par variables d'environnement (Docker, Podman, Kubernetes) ou par flags CLI.
+// Toutes les options sensibles (DSN PostgreSQL, secrets de proxy, domaines, politiques de sécurité,
+// gestion des mots de passe et 2FA TOTP Authelia) sont injectables par variables d'environnement ou flags CLI.
 package config
 
 import (
@@ -15,7 +15,7 @@ type ServerConfig struct {
 	// Réseau & Serveur HTTP
 	Port            string // Port interne du conteneur (par défaut "8080")
 	AppDomain       string // Domaine public de l'application (ex: "aigle.heimerdinger.studio")
-	AuthDomain      string // Domaine public du portail Authelia (ex: "airgle-auth.heimerdinger.studio")
+	AuthDomain      string // Domaine public du portail Authelia (ex: "aigle-auth.heimerdinger.studio")
 	ReadTimeoutSec  int    // Timeout de lecture HTTP (protection Slowloris)
 	WriteTimeoutSec int    // Timeout d'écriture HTTP
 	MaxBodyBytes    int64  // Taille maximale d'un corps de requête JSON (par défaut 2 Mo)
@@ -31,6 +31,16 @@ type ServerConfig struct {
 	ManagerGroups      []string // Groupes Authelia donnant le rôle "manager" (ex: ["managers", "chefs-de-projet"])
 	DefaultUserEmail   string   // Utilisé uniquement si AuthMode == "dev"
 	DefaultUserName    string   // Utilisé uniquement si AuthMode == "dev"
+
+	// Gestion de Compte, Changement de Mot de Passe & Synchronisation Authelia (TODO #1 & #3)
+	// PasswordMode :
+	//   - "both"          (par défaut) : Changement direct Argon2id dans Aigle (sans SMTP) + lien/config Portail Authelia SMTP
+	//   - "direct"        : Changement de mot de passe direct dans Aigle (écriture Argon2id dans users_database.yml + DB)
+	//   - "authelia_smtp" : Délégation exclusive au portail natif Authelia (/settings) avec validation par email SMTP
+	PasswordMode       string
+	AutheliaUsersFile  string // Chemin vers users_database.yml d'Authelia (ex: "/authelia-config/users_database.yml")
+	AutheliaConfigFile string // Chemin vers configuration.yml d'Authelia (ex: "/authelia-config/configuration.yml")
+	TOTPSessionMinutes int    // Durée de validité d'une vérification 2FA TOTP en minutes (par défaut 720 = 12h)
 
 	// Protection Rate-Limiting (Anti-BruteForce / Anti-DoS applicatif)
 	RateLimitRPS   float64 // Requêtes par seconde autorisées par IP
@@ -48,7 +58,7 @@ func Load() *ServerConfig {
 	cfg := &ServerConfig{
 		Port:               getEnv("AIGLE_PORT", "8080"),
 		AppDomain:          getEnv("AIGLE_APP_DOMAIN", "aigle.heimerdinger.studio"),
-		AuthDomain:         getEnv("AIGLE_AUTH_DOMAIN", "airgle-auth.heimerdinger.studio"),
+		AuthDomain:         getEnv("AIGLE_AUTH_DOMAIN", "aigle-auth.heimerdinger.studio"),
 		ReadTimeoutSec:     getEnvInt("AIGLE_READ_TIMEOUT_SEC", 15),
 		WriteTimeoutSec:    getEnvInt("AIGLE_WRITE_TIMEOUT_SEC", 30),
 		MaxBodyBytes:       int64(getEnvInt("AIGLE_MAX_BODY_BYTES", 2*1024*1024)), // 2 Mo max
@@ -60,6 +70,10 @@ func Load() *ServerConfig {
 		ManagerGroups:      splitCSV(getEnv("AIGLE_MANAGER_GROUPS", "managers,aigle-manager")),
 		DefaultUserEmail:   getEnv("AIGLE_DEV_USER_EMAIL", "admin@heimerdinger.studio"),
 		DefaultUserName:    getEnv("AIGLE_DEV_USER_NAME", "Administrateur Aigle"),
+		PasswordMode:       strings.ToLower(getEnv("AIGLE_PASSWORD_MODE", "both")),
+		AutheliaUsersFile:  getEnv("AIGLE_AUTHELIA_USERS_FILE", "./authelia/users_database.yml"),
+		AutheliaConfigFile: getEnv("AIGLE_AUTHELIA_CONFIG_FILE", "./authelia/configuration.yml"),
+		TOTPSessionMinutes: getEnvInt("AIGLE_TOTP_SESSION_MINUTES", 720),
 		RateLimitRPS:       float64(getEnvInt("AIGLE_RATE_LIMIT_RPS", 25)),
 		RateLimitBurst:     getEnvInt("AIGLE_RATE_LIMIT_BURST", 60),
 		DownloadsDir:       getEnv("AIGLE_DOWNLOADS_DIR", "./downloads"),
@@ -69,9 +83,14 @@ func Load() *ServerConfig {
 	flag.StringVar(&cfg.DBDriver, "db-driver", cfg.DBDriver, "Driver SQL : 'postgres' ou 'sqlite'")
 	flag.StringVar(&cfg.DBDSN, "db", cfg.DBDSN, "DSN PostgreSQL ou fichier SQLite")
 	flag.StringVar(&cfg.AuthMode, "auth-mode", cfg.AuthMode, "Mode d'authentification : 'authelia' ou 'dev'")
+	flag.StringVar(&cfg.PasswordMode, "password-mode", cfg.PasswordMode, "Mode mot de passe : 'both', 'direct' ou 'authelia_smtp'")
+	flag.StringVar(&cfg.AutheliaUsersFile, "authelia-users", cfg.AutheliaUsersFile, "Chemin vers users_database.yml d'Authelia")
+	flag.StringVar(&cfg.AutheliaConfigFile, "authelia-config", cfg.AutheliaConfigFile, "Chemin vers configuration.yml d'Authelia")
 	flag.StringVar(&cfg.DownloadsDir, "downloads-dir", cfg.DownloadsDir, "Dossier des binaires téléchargeables (Windows, macOS, Linux)")
 	flag.BoolVar(&cfg.RunHealthcheck, "healthcheck", false, "Exécute une sonde HTTP de santé locale et quitte (pour Docker HEALTHCHECK)")
-	flag.Parse()
+	if !flag.Parsed() {
+		flag.Parse()
+	}
 
 	return cfg
 }
@@ -103,4 +122,3 @@ func splitCSV(s string) []string {
 	}
 	return out
 }
-

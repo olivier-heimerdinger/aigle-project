@@ -3,8 +3,10 @@
 //   1. Le rejet des requêtes non authentifiées en mode Authelia Zero-Trust (401 Unauthorized)
 //   2. La protection anti-spoofing d'en-têtes via le secret partagé X-Aigle-Proxy-Secret
 //   3. La synchronisation automatique des profils et groupes Authelia (superadmin vs viewer)
-//   4. L'application stricte du RBAC (blocage d'écriture pour un 'viewer', accès console '/api/admin' réservé au 'superadmin')
-//   5. L'isolation Multi-Tenant entre Workspaces et la génération des journaux d'audit (audit_logs)
+//   4. L'application stricte du RBAC et des permissions fines par projet (Maître du projet, Exécutant, Lecteur)
+//   5. Le changement de mot de passe Argon2id direct (users_database.yml + DB) et le mode Portail Authelia
+//   6. L'enrôlement 2FA TOTP (QR Code SVG + RFC 6238), la protection 2FA par projet (428 Precondition Required)
+//      et la synchronisation automatique des règles two_factor dans configuration.yml d'Authelia
 package api
 
 import (
@@ -14,8 +16,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/aigle/aigle-server/internal/authelia"
 	"github.com/aigle/aigle-server/internal/config"
 	"github.com/aigle/aigle-server/internal/database"
 	"github.com/aigle/aigle-server/internal/models"
@@ -27,13 +32,19 @@ func setupTestServer(t *testing.T, proxySecret string) http.Handler {
 	dbPath := filepath.Join(tmpDir, "aigle_saas_test.db")
 	dlDir := filepath.Join(tmpDir, "downloads")
 	_ = os.MkdirAll(dlDir, 0755)
-	// Création d'un binaire de test pour vérifier le téléchargement public et le calcul SHA-256
 	_ = os.WriteFile(filepath.Join(dlDir, "aigle-windows-amd64.exe"), []byte("MZ-AIGLE-TEST-BINARY"), 0644)
+
+	initHash, _ := authelia.HashPasswordArgon2id("AigleAdmin2026!")
+	usersFile := filepath.Join(tmpDir, "users_database.yml")
+	_ = os.WriteFile(usersFile, []byte("users:\n  admin:\n    disabled: false\n    displayname: \"Admin Studio\"\n    email: \"admin@heimerdinger.studio\"\n    password: \""+initHash+"\"\n    groups:\n      - admins\n"), 0600)
+
+	configFile := filepath.Join(tmpDir, "configuration.yml")
+	_ = os.WriteFile(configFile, []byte("access_control:\n  default_policy: 'deny'\n  rules:\n    - domain: 'aigle.heimerdinger.studio'\n      policy: 'one_factor'\n"), 0600)
 
 	cfg := &config.ServerConfig{
 		Port:               "8090",
 		AppDomain:          "aigle.heimerdinger.studio",
-		AuthDomain:         "airgle-auth.heimerdinger.studio",
+		AuthDomain:         "aigle-auth.heimerdinger.studio",
 		ReadTimeoutSec:     10,
 		WriteTimeoutSec:    10,
 		MaxBodyBytes:       2 << 20,
@@ -45,6 +56,10 @@ func setupTestServer(t *testing.T, proxySecret string) http.Handler {
 		ManagerGroups:      []string{"managers", "aigle-manager"},
 		DefaultUserEmail:   "admin@heimerdinger.studio",
 		DefaultUserName:    "Admin Studio",
+		PasswordMode:       "both",
+		AutheliaUsersFile:  usersFile,
+		AutheliaConfigFile: configFile,
+		TOTPSessionMinutes: 720,
 		RateLimitRPS:       100,
 		RateLimitBurst:     200,
 		DownloadsDir:       dlDir,
@@ -69,7 +84,6 @@ func TestAutheliaZeroTrustAndProxySecret(t *testing.T) {
 	if recHealth.Code != http.StatusOK {
 		t.Fatalf("Attendu 200 sur /api/health, obtenu %d", recHealth.Code)
 	}
-	// Vérification de la présence des en-têtes de sécurité OWASP
 	if recHealth.Header().Get("X-Frame-Options") != "DENY" {
 		t.Errorf("En-tête X-Frame-Options: DENY manquant")
 	}
@@ -110,7 +124,7 @@ func TestRBACAndMultiTenantIsolation(t *testing.T) {
 	handler := setupTestServer(t, "")
 
 	// 1. Connexion d'un utilisateur "viewer" (groupe 'viewers')
-	reqViewerWrite := httptest.NewRequest(http.MethodPost, "/api/projects/prj_demo_saas/tickets", bytes.NewBufferString(`{"title":"Ticket non autorisé"}`))
+	reqViewerWrite := httptest.NewRequest(http.MethodPost, "/api/projects/prj_cloud/tickets", bytes.NewBufferString(`{"title":"Ticket non autorisé"}`))
 	reqViewerWrite.Header.Set("Remote-User", "guest")
 	reqViewerWrite.Header.Set("Remote-Email", "guest@client.fr")
 	reqViewerWrite.Header.Set("Remote-Groups", "viewers")
@@ -157,7 +171,6 @@ func TestRBACAndMultiTenantIsolation(t *testing.T) {
 func TestPublicPortalAndDownloadsSecurity(t *testing.T) {
 	handler := setupTestServer(t, "secret-traefik-token-999")
 
-	// 1. La racine publique (/) est accessible SANS authentification Authelia (200 OK)
 	reqRoot := httptest.NewRequest(http.MethodGet, "/", nil)
 	recRoot := httptest.NewRecorder()
 	handler.ServeHTTP(recRoot, reqRoot)
@@ -165,7 +178,6 @@ func TestPublicPortalAndDownloadsSecurity(t *testing.T) {
 		t.Fatalf("Attendu 200 sur la vitrine publique /, obtenu %d", recRoot.Code)
 	}
 
-	// 2. L'espace SaaS (/app) est PROTÉGÉ et renvoie 401 sans en-têtes Authelia
 	reqAppNoAuth := httptest.NewRequest(http.MethodGet, "/app", nil)
 	recAppNoAuth := httptest.NewRecorder()
 	handler.ServeHTTP(recAppNoAuth, reqAppNoAuth)
@@ -173,7 +185,6 @@ func TestPublicPortalAndDownloadsSecurity(t *testing.T) {
 		t.Fatalf("Attendu 401 sur l'espace protégé /app sans Authelia, obtenu %d", recAppNoAuth.Code)
 	}
 
-	// 3. Le catalogue public des téléchargements (/public/api/releases) est accessible sans auth (200 OK)
 	reqRel := httptest.NewRequest(http.MethodGet, "/public/api/releases", nil)
 	recRel := httptest.NewRecorder()
 	handler.ServeHTTP(recRel, reqRel)
@@ -181,7 +192,6 @@ func TestPublicPortalAndDownloadsSecurity(t *testing.T) {
 		t.Fatalf("Attendu 200 sur /public/api/releases, obtenu %d", recRel.Code)
 	}
 
-	// 4. Le téléchargement du binaire Windows autorisé fonctionne et renvoie l'en-tête X-Checksum-SHA256
 	reqDL := httptest.NewRequest(http.MethodGet, "/public/downloads/aigle-windows-amd64.exe", nil)
 	recDL := httptest.NewRecorder()
 	handler.ServeHTTP(recDL, reqDL)
@@ -192,11 +202,138 @@ func TestPublicPortalAndDownloadsSecurity(t *testing.T) {
 		t.Errorf("En-tête X-Checksum-SHA256 manquant sur le téléchargement du binaire")
 	}
 
-	// 5. Tentative d'accès à un fichier hors liste blanche -> rejeté (404/400)
 	reqEvil := httptest.NewRequest(http.MethodGet, "/public/downloads/aigle_saas_test.db", nil)
 	recEvil := httptest.NewRecorder()
 	handler.ServeHTTP(recEvil, reqEvil)
 	if recEvil.Code == http.StatusOK {
 		t.Fatalf("Un fichier hors liste blanche ne doit jamais pouvoir être téléchargé")
+	}
+}
+
+func TestAccountPasswordAndTOTPAndGranularProjectPermissions(t *testing.T) {
+	handler := setupTestServer(t, "")
+
+	// 1. Changement de mot de passe Argon2id direct (TODO #1)
+	// Mauvais mot de passe actuel -> 401
+	reqBadPwd := httptest.NewRequest(http.MethodPost, "/api/account/password", bytes.NewBufferString(`{"current_password":"WrongPassword","new_password":"NewSecurePassword2026!","confirm_password":"NewSecurePassword2026!"}`))
+	reqBadPwd.Header.Set("Remote-User", "admin")
+	reqBadPwd.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqBadPwd.Header.Set("Remote-Groups", "admins")
+	recBadPwd := httptest.NewRecorder()
+	handler.ServeHTTP(recBadPwd, reqBadPwd)
+	if recBadPwd.Code != http.StatusUnauthorized {
+		t.Fatalf("Attendu 401 avec un mauvais mot de passe actuel, obtenu %d", recBadPwd.Code)
+	}
+
+	// Bon mot de passe actuel -> 200 OK et synchronisation Argon2id dans users_database.yml
+	reqGoodPwd := httptest.NewRequest(http.MethodPost, "/api/account/password", bytes.NewBufferString(`{"current_password":"AigleAdmin2026!","new_password":"NewSecurePassword2026!","confirm_password":"NewSecurePassword2026!"}`))
+	reqGoodPwd.Header.Set("Remote-User", "admin")
+	reqGoodPwd.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqGoodPwd.Header.Set("Remote-Groups", "admins")
+	recGoodPwd := httptest.NewRecorder()
+	handler.ServeHTTP(recGoodPwd, reqGoodPwd)
+	if recGoodPwd.Code != http.StatusOK {
+		t.Fatalf("Attendu 200 lors du changement de mot de passe Argon2id, obtenu %d: %s", recGoodPwd.Code, recGoodPwd.Body.String())
+	}
+
+	// 2. Enrôlement 2FA TOTP (QR Code SVG + Activation RFC 6238) (TODO #3)
+	reqSetupTOTP := httptest.NewRequest(http.MethodPost, "/api/account/totp/setup", nil)
+	reqSetupTOTP.Header.Set("Remote-User", "admin")
+	reqSetupTOTP.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqSetupTOTP.Header.Set("Remote-Groups", "admins")
+	recSetupTOTP := httptest.NewRecorder()
+	handler.ServeHTTP(recSetupTOTP, reqSetupTOTP)
+	if recSetupTOTP.Code != http.StatusOK {
+		t.Fatalf("Attendu 200 sur /api/account/totp/setup, obtenu %d", recSetupTOTP.Code)
+	}
+	var totpSetup struct {
+		Secret string `json:"secret"`
+		QRSVG  string `json:"qr_svg"`
+	}
+	_ = json.NewDecoder(recSetupTOTP.Body).Decode(&totpSetup)
+	if totpSetup.Secret == "" || !strings.HasPrefix(totpSetup.QRSVG, "data:image/svg+xml;base64,") {
+		t.Fatalf("Secret TOTP ou QR Code SVG invalide: %+v", totpSetup)
+	}
+
+	validCode, err := authelia.CurrentTOTPCode(totpSetup.Secret, time.Now())
+	if err != nil {
+		t.Fatalf("Erreur calcul code TOTP: %v", err)
+	}
+	reqActivateTOTP := httptest.NewRequest(http.MethodPost, "/api/account/totp/activate", bytes.NewBufferString(`{"code":"`+validCode+`"}`))
+	reqActivateTOTP.Header.Set("Remote-User", "admin")
+	reqActivateTOTP.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqActivateTOTP.Header.Set("Remote-Groups", "admins")
+	recActivateTOTP := httptest.NewRecorder()
+	handler.ServeHTTP(recActivateTOTP, reqActivateTOTP)
+	if recActivateTOTP.Code != http.StatusOK {
+		t.Fatalf("Attendu 200 lors de l'activation TOTP, obtenu %d: %s", recActivateTOTP.Code, recActivateTOTP.Body.String())
+	}
+
+	// 3. Création d'un utilisateur "Exécutant" (peut déplacer les tickets et pointer, mais PAS créer ni supprimer de ticket) (TODO #2)
+	reqExecLogin := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	reqExecLogin.Header.Set("Remote-User", "operateur")
+	reqExecLogin.Header.Set("Remote-Email", "operateur@heimerdinger.studio")
+	reqExecLogin.Header.Set("Remote-Name", "Opérateur Exécutant")
+	reqExecLogin.Header.Set("Remote-Groups", "developers")
+	recExecLogin := httptest.NewRecorder()
+	handler.ServeHTTP(recExecLogin, reqExecLogin)
+	var execMe struct {
+		User models.User `json:"user"`
+	}
+	_ = json.NewDecoder(recExecLogin.Body).Decode(&execMe)
+
+	// Attribution du rôle prédéfini "executor" sur le projet prj_cloud
+	reqAssignExec := httptest.NewRequest(http.MethodPost, "/api/projects/prj_cloud/members", bytes.NewBufferString(`{"user_id":"`+execMe.User.ID+`","project_role":"executor","apply_preset":true}`))
+	reqAssignExec.Header.Set("Remote-User", "admin")
+	reqAssignExec.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqAssignExec.Header.Set("Remote-Groups", "admins")
+	recAssignExec := httptest.NewRecorder()
+	handler.ServeHTTP(recAssignExec, reqAssignExec)
+	if recAssignExec.Code != http.StatusOK {
+		t.Fatalf("Attendu 200 lors de l'affectation du rôle executor, obtenu %d: %s", recAssignExec.Code, recAssignExec.Body.String())
+	}
+
+	// L'exécutant tente de créer un nouveau ticket -> doit être refusé (403 car CanWriteTickets = false)
+	reqExecCreate := httptest.NewRequest(http.MethodPost, "/api/projects/prj_cloud/tickets", bytes.NewBufferString(`{"title":"Nouveau ticket non autorisé"}`))
+	reqExecCreate.Header.Set("Remote-User", "operateur")
+	reqExecCreate.Header.Set("Remote-Email", "operateur@heimerdinger.studio")
+	reqExecCreate.Header.Set("Remote-Groups", "developers")
+	recExecCreate := httptest.NewRecorder()
+	handler.ServeHTTP(recExecCreate, reqExecCreate)
+	if recExecCreate.Code != http.StatusForbidden {
+		t.Fatalf("Un exécutant (CanWriteTickets=false) ne doit pas pouvoir créer un ticket (attendu 403, obtenu %d)", recExecCreate.Code)
+	}
+
+	// L'exécutant déplace un ticket existant (CanExecute = true) -> doit être autorisé (200 OK)
+	reqExecMove := httptest.NewRequest(http.MethodPatch, "/api/tickets/tck_3/move", bytes.NewBufferString(`{"status":"review"}`))
+	reqExecMove.Header.Set("Remote-User", "operateur")
+	reqExecMove.Header.Set("Remote-Email", "operateur@heimerdinger.studio")
+	reqExecMove.Header.Set("Remote-Groups", "developers")
+	recExecMove := httptest.NewRecorder()
+	handler.ServeHTTP(recExecMove, reqExecMove)
+	if recExecMove.Code != http.StatusOK {
+		t.Fatalf("Un exécutant (CanExecute=true) doit pouvoir déplacer un ticket dans le Kanban (attendu 200, obtenu %d: %s)", recExecMove.Code, recExecMove.Body.String())
+	}
+
+	// 4. Activation de la double authentification 2FA TOTP obligatoire sur le projet prj_cloud (TODO #3)
+	reqEnableProjTOTP := httptest.NewRequest(http.MethodPut, "/api/projects/prj_cloud/security", bytes.NewBufferString(`{"require_totp":true}`))
+	reqEnableProjTOTP.Header.Set("Remote-User", "admin")
+	reqEnableProjTOTP.Header.Set("Remote-Email", "admin@heimerdinger.studio")
+	reqEnableProjTOTP.Header.Set("Remote-Groups", "admins")
+	recEnableProjTOTP := httptest.NewRecorder()
+	handler.ServeHTTP(recEnableProjTOTP, reqEnableProjTOTP)
+	if recEnableProjTOTP.Code != http.StatusOK {
+		t.Fatalf("Attendu 200 lors de l'activation 2FA sur le projet, obtenu %d: %s", recEnableProjTOTP.Code, recEnableProjTOTP.Body.String())
+	}
+
+	// L'opérateur (qui n'a pas encore validé de code 2FA TOTP pour sa session) tente d'ouvrir le projet -> 428 Precondition Required (TOTP_REQUIRED)
+	reqOpAccess := httptest.NewRequest(http.MethodGet, "/api/projects/prj_cloud/full", nil)
+	reqOpAccess.Header.Set("Remote-User", "operateur")
+	reqOpAccess.Header.Set("Remote-Email", "operateur@heimerdinger.studio")
+	reqOpAccess.Header.Set("Remote-Groups", "developers")
+	recOpAccess := httptest.NewRecorder()
+	handler.ServeHTTP(recOpAccess, reqOpAccess)
+	if recOpAccess.Code != http.StatusPreconditionRequired {
+		t.Fatalf("Attendu 428 (TOTP_REQUIRED) sur un projet protégé par 2FA pour un utilisateur non vérifié, obtenu %d", recOpAccess.Code)
 	}
 }

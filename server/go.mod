@@ -1,10 +1,13 @@
-module github.com/olivier-heimerdinger/aigle-project
+module github.com/aigle/aigle-server
 
-go 1.23
+go 1.26.0
 
 toolchain go1.26.7
 
-require modernc.org/sqlite v1.61.0
+require (
+	github.com/lib/pq v1.12.3
+	modernc.org/sqlite v1.61.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
