@@ -1,0 +1,70 @@
+# ==============================================================================
+# COMPOSE.OVERRIDE.YML — LABELS TRAEFIK : ZONE PUBLIQUE vs ZONE PROTEGEE AUTHELIA
+# ==============================================================================
+# Architecture à double zone sur aigle.heimerdinger.studio :
+#   1. Zone Publique (routeur 'aigle-public' SANS Authelia) :
+#        - /                  : Vitrine & Mini-Présentation interactive
+#        - /public/downloads/ : Téléchargement des binaires Windows, macOS, Linux & PPTX
+#        - /public/api/       : Catalogue JSON des binaires et empreintes SHA-256
+#        - /assets/           : Bundle statique JS/CSS Svelte 5
+#        - /api/health        : Sonde de santé publique
+#   2. Zone SaaS Protégée (routeur 'aigle-protected' AVEC Authelia ForwardAuth) :
+#        - /app               : Espace de travail SaaS Multi-Tenant & Console Admin
+#        - /api/...           : API métier et d'administration (/api/admin/...)
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # Exposition Traefik du Portail SSO Authelia
+  # ----------------------------------------------------------------------------
+  authelia:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.aigle-auth.rule=Host(`airgle-auth.heimerdinger.studio`) || Host(`aigle-auth.heimerdinger.studio`)"
+      - "traefik.http.routers.aigle-auth.entrypoints=websecure"
+      - "traefik.http.routers.aigle-auth.tls=true"
+      - "traefik.http.routers.aigle-auth.tls.certresolver=myresolver"
+      - "traefik.http.services.aigle-auth.loadbalancer.server.port=9091"
+      # Définition du Middleware ForwardAuth utilisé par le routeur aigle-protected
+      - "traefik.http.middlewares.aigle-authelia.forwardauth.address=http://aigle-authelia:9091/api/authz/forward-auth"
+      - "traefik.http.middlewares.aigle-authelia.forwardauth.trustForwardHeader=true"
+      - "traefik.http.middlewares.aigle-authelia.forwardauth.authResponseHeaders=Remote-User,Remote-Groups,Remote-Name,Remote-Email"
+
+  # ----------------------------------------------------------------------------
+  # Exposition Traefik d'Aigle Server (Routeur Public + Routeur Protégé Authelia)
+  # ----------------------------------------------------------------------------
+  aigle-server:
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.services.aigle.loadbalancer.server.port=8080"
+
+      # En-têtes de sécurité Traefik + injection du secret partagé Zero-Trust
+      - "traefik.http.middlewares.aigle-headers.headers.SSLRedirect=true"
+      - "traefik.http.middlewares.aigle-headers.headers.STSSeconds=315360000"
+      - "traefik.http.middlewares.aigle-headers.headers.browserXSSFilter=true"
+      - "traefik.http.middlewares.aigle-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.aigle-headers.headers.forceSTSHeader=true"
+      - "traefik.http.middlewares.aigle-headers.headers.SSLHost=aigle.heimerdinger.studio"
+      - "traefik.http.middlewares.aigle-headers.headers.STSIncludeSubdomains=true"
+      - "traefik.http.middlewares.aigle-headers.headers.STSPreload=true"
+      - "traefik.http.middlewares.aigle-headers.headers.customRequestHeaders.X-Aigle-Proxy-Secret=${AIGLE_TRUSTED_PROXY_SECRET}"
+
+      # 1. ROUTEUR PROTÉGÉ SAAS (Priorité 100 : /app et /api/* sauf /api/health — Protégé par Authelia SSO ForwardAuth)
+      - "traefik.http.routers.aigle-protected.rule=Host(`aigle.heimerdinger.studio`) && (PathPrefix(`/app`) || (PathPrefix(`/api`) && !Path(`/api/health`)))"
+      - "traefik.http.routers.aigle-protected.priority=100"
+      - "traefik.http.routers.aigle-protected.entrypoints=websecure"
+      - "traefik.http.routers.aigle-protected.tls=true"
+      - "traefik.http.routers.aigle-protected.tls.certresolver=myresolver"
+      - "traefik.http.routers.aigle-protected.service=aigle"
+      - "traefik.http.routers.aigle-protected.middlewares=aigle-headers@docker,aigle-authelia@docker"
+
+      # 2. ROUTEUR PUBLIC (Priorité 50 : Vitrine /, /public/*, /assets/*, /api/health — Sans Authelia)
+      - "traefik.http.routers.aigle-public.rule=Host(`aigle.heimerdinger.studio`)"
+      - "traefik.http.routers.aigle-public.priority=50"
+      - "traefik.http.routers.aigle-public.entrypoints=websecure"
+      - "traefik.http.routers.aigle-public.tls=true"
+      - "traefik.http.routers.aigle-public.tls.certresolver=myresolver"
+      - "traefik.http.routers.aigle-public.service=aigle"
+      - "traefik.http.routers.aigle-public.middlewares=aigle-headers@docker"

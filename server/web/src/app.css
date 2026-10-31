@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Barres de défilement personnalisées pour le Gantt, le Kanban et la Console Admin */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+

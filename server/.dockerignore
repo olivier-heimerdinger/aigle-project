@@ -1,0 +1,8 @@
+web/node_modules
+*.exe
+*.db
+*.db-wal
+*.db-shm
+.env
+authelia/db.sqlite3
+authelia/notification.txt

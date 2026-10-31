@@ -1,0 +1,174 @@
+# ==============================================================================
+# MANIFESTES KUBERNETES (K8S / K3S) — AIGLE SAAS SERVER
+# Déploiement Haute Disponibilité avec SecurityContext Non-Root, Probes & Ingress
+# ==============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aigle-saas
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aigle-secrets
+  namespace: aigle-saas
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "ChangeMe_K8s_Postgres_Password_2026!"
+  AIGLE_DB_DSN: "postgres://aigle:ChangeMe_K8s_Postgres_Password_2026!@aigle-postgres:5432/aigle_saas?sslmode=disable"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aigle-postgres
+  namespace: aigle-saas
+spec:
+  serviceName: "aigle-postgres"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aigle-postgres
+  template:
+    metadata:
+      labels:
+        app: aigle-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "aigle"
+            - name: POSTGRES_DB
+              value: "aigle_saas"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: aigle-secrets
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aigle-postgres
+  namespace: aigle-saas
+spec:
+  ports:
+    - port: 5432
+  selector:
+    app: aigle-postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aigle-server
+  namespace: aigle-saas
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aigle-server
+  template:
+    metadata:
+      labels:
+        app: aigle-server
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: aigle-server
+          image: aigle-saas-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: AIGLE_PORT
+              value: "8080"
+            - name: AIGLE_APP_DOMAIN
+              value: "aigle.heimerdinger.studio"
+            - name: AIGLE_AUTH_DOMAIN
+              value: "airgle-auth.heimerdinger.studio"
+            - name: AIGLE_DB_DRIVER
+              value: "postgres"
+            - name: AIGLE_AUTH_MODE
+              value: "authelia"
+            - name: AIGLE_DB_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: aigle-secrets
+                  key: AIGLE_DB_DSN
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aigle-server
+  namespace: aigle-saas
+spec:
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: aigle-server
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aigle-ingress
+  namespace: aigle-saas
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/router.tls.certresolver: myresolver
+spec:
+  rules:
+    - host: aigle.heimerdinger.studio
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aigle-server
+                port:
+                  number: 8080
+

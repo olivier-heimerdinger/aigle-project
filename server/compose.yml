@@ -1,0 +1,111 @@
+# ==============================================================================
+# DOCKER / PODMAN COMPOSE — AIGLE SAAS SERVER + POSTGRESQL 16 + AUTHELIA SSO
+# ==============================================================================
+# Architecture réseau :
+#   - braigle : Réseau bridge interne isolé (PostgreSQL 16, Redis, Authelia, Aigle)
+#   - web     : Réseau externe Traefik existant sur le serveur (192.168.1.150)
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Serveur Applicatif Aigle SaaS (Go + Svelte 5 embarqué)
+  # ----------------------------------------------------------------------------
+  aigle-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: aigle-saas-server:latest
+    container_name: aigle-server
+    restart: unless-stopped
+    depends_on:
+      aigle-postgres:
+        condition: service_healthy
+    environment:
+      AIGLE_PORT: "8080"
+      AIGLE_APP_DOMAIN: "${AIGLE_APP_DOMAIN:-aigle.heimerdinger.studio}"
+      AIGLE_AUTH_DOMAIN: "${AIGLE_AUTH_DOMAIN:-airgle-auth.heimerdinger.studio}"
+      AIGLE_DB_DRIVER: "postgres"
+      AIGLE_DB_DSN: "postgres://${POSTGRES_USER:-aigle}:${POSTGRES_PASSWORD}@aigle-postgres:5432/${POSTGRES_DB:-aigle_saas}?sslmode=disable"
+      AIGLE_AUTH_MODE: "${AIGLE_AUTH_MODE:-authelia}"
+      AIGLE_TRUSTED_PROXY_SECRET: "${AIGLE_TRUSTED_PROXY_SECRET:-}"
+      AIGLE_ADMIN_GROUPS: "${AIGLE_ADMIN_GROUPS:-admins,superadmin,aigle-admin}"
+      AIGLE_MANAGER_GROUPS: "${AIGLE_MANAGER_GROUPS:-managers,aigle-manager}"
+      AIGLE_RATE_LIMIT_RPS: "30"
+      AIGLE_RATE_LIMIT_BURST: "80"
+      TZ: "Europe/Paris"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      - braigle
+      - web
+
+  # ----------------------------------------------------------------------------
+  # 2. Base de données relationnelle PostgreSQL 16 (Isolée sur le réseau braigle)
+  # ----------------------------------------------------------------------------
+  aigle-postgres:
+    image: postgres:16-alpine
+    container_name: aigle-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-aigle}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Veuillez definir POSTGRES_PASSWORD dans .env}"
+      POSTGRES_DB: "${POSTGRES_DB:-aigle_saas}"
+      TZ: "Europe/Paris"
+    volumes:
+      - aigle_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aigle} -d ${POSTGRES_DB:-aigle_saas}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - braigle
+
+  # ----------------------------------------------------------------------------
+  # 3. Portail d'Authentification SSO & 2FA Authelia
+  # ----------------------------------------------------------------------------
+  authelia:
+    image: authelia/authelia:latest
+    container_name: aigle-authelia
+    restart: unless-stopped
+    depends_on:
+      - authelia-redis
+    environment:
+      TZ: "Europe/Paris"
+    volumes:
+      - ./authelia:/config
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - braigle
+      - web
+
+  # ----------------------------------------------------------------------------
+  # 4. Cache de Sessions Redis pour Authelia (Isolé sur le réseau braigle)
+  # ----------------------------------------------------------------------------
+  authelia-redis:
+    image: redis:7-alpine
+    container_name: aigle-authelia-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - aigle_redisdata:/data
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - braigle
+
+volumes:
+  aigle_pgdata:
+  aigle_redisdata:
+
+networks:
+  braigle:
+    driver: bridge
+  web:
+    external: true
+

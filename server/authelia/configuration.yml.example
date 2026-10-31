@@ -1,0 +1,99 @@
+# ==============================================================================
+# CONFIGURATION AUTHELIA V4 — PORTAIL SSO & 2FA POUR AIGLE SAAS
+# Copiez vers server/authelia/configuration.yml et remplacez les 3 secrets
+# ==============================================================================
+
+theme: dark
+
+server:
+  address: 'tcp://0.0.0.0:9091/'
+
+log:
+  level: info
+
+totp:
+  disable: false
+  issuer: 'heimerdinger.studio'
+  period: 30
+  skew: 1
+
+webauthn:
+  disable: false
+  display_name: 'Aigle SaaS SSO'
+
+authentication_backend:
+  file:
+    path: '/config/users_database.yml'
+    watch: true
+    password:
+      algorithm: 'argon2'
+      argon2:
+        variant: 'argon2id'
+        iterations: 3
+        memory: 65536
+        parallelism: 4
+        key_length: 32
+        salt_length: 16
+
+# Protection Anti-BruteForce : bloque l'IP pendant 5 min après 5 échecs en 2 min
+regulation:
+  max_retries: 5
+  find_time: '2m'
+  ban_time: '5m'
+
+session:
+  name: 'authelia_session'
+  secret: 'REMPLACER_PAR_SECRET_SESSION_ALEATOIRE_64_CHARS'
+  same_site: 'lax'
+  inactivity: '1h'
+  expiration: '12h'
+  remember_me: '7d'
+  cookies:
+    - domain: 'heimerdinger.studio'
+      authelia_url: 'https://airgle-auth.heimerdinger.studio'
+      default_redirection_url: 'https://aigle.heimerdinger.studio/app'
+  redis:
+    host: 'aigle-authelia-redis'
+    port: 6379
+
+storage:
+  encryption_key: 'REMPLACER_PAR_CLE_CHIFFREMENT_STORAGE_64_CHARS'
+  local:
+    path: '/config/db.sqlite3'
+
+notifier:
+  disable_startup_check: false
+  filesystem:
+    filename: '/config/notification.txt'
+
+identity_validation:
+  reset_password:
+    jwt_secret: 'REMPLACER_PAR_SECRET_JWT_RESET_PASSWORD_64_CHARS'
+
+# Politique de contrôle d'accès Zero-Trust (Zone Publique vs Zone SaaS Protégée)
+access_control:
+  default_policy: 'deny'
+  rules:
+    # 1. ZONE PUBLIQUE : Vitrine (/), Téléchargements Multi-OS (/public/*), Assets & Sonde de Santé
+    - domain: 'aigle.heimerdinger.studio'
+      resources:
+        - '^/$'
+        - '^/public(/.*)?$'
+        - '^/assets(/.*)?$'
+        - '^/api/health$'
+      policy: 'bypass'
+
+    # 2. ZONE ADMIN SAAS : Réservée au groupe 'admins'
+    - domain: 'aigle.heimerdinger.studio'
+      resources:
+        - '^/api/admin(/.*)?$'
+      subject:
+        - 'group:admins'
+      policy: 'one_factor' # Peut être passé à 'two_factor' pour exiger la 2FA TOTP/WebAuthn
+
+    # 3. ZONE SAAS PROTÉGÉE (/app et /api/*) : Authentification obligatoire
+    - domain: 'aigle.heimerdinger.studio'
+      resources:
+        - '^/app(/.*)?$'
+        - '^/api(/.*)?$'
+      policy: 'one_factor'

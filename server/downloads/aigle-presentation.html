@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aigle — Présentation du Logiciel de Pilotage de Projet</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #0f172a;
+      --border: #1e293b;
+      --accent: #6366f1;
+      --accent-light: #818cf8;
+      --emerald: #10b981;
+      --rose: #f43f5e;
+      --amber: #f59e0b;
+      --sky: #38bdf8;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      height: 100vh;
+      width: 100vw;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Slider Container */
+    #presentation {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      padding: 3.5rem 5rem;
+      opacity: 0;
+      visibility: hidden;
+      transform: scale(0.97) translateY(10px);
+      transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+
+    .slide.active {
+      opacity: 1;
+      visibility: visible;
+      transform: scale(1) translateY(0);
+    }
+
+    /* Typography & Headers */
+    .slide-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      color: var(--accent-light);
+      padding: 0.35rem 0.85rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 1.25rem;
+      width: fit-content;
+    }
+
+    h1 {
+      font-size: 3.2rem;
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 1.25rem;
+      background: linear-gradient(135deg, #ffffff 40%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    h2 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      margin-bottom: 0.75rem;
+      color: #ffffff;
+    }
+
+    p.subtitle {
+      font-size: 1.25rem;
+      color: var(--text-muted);
+      max-width: 900px;
+      line-height: 1.6;
+      margin-bottom: 2rem;
+    }
+
+    /* Layout Grids */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.5rem;
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.5rem;
+    }
+
+    .grid-4 {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1.25rem;
+    }
+
+    /* Feature Cards */
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      padding: 1.5rem;
+      position: relative;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+
+    .card h3 {
+      font-size: 1.2rem;
+      color: #fff;
+      margin-bottom: 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+
+    .card p, .card li {
+      font-size: 0.95rem;
+      color: var(--text-muted);
+      line-height: 1.55;
+    }
+
+    .card ul {
+      list-style: none;
+      margin-top: 0.5rem;
+    }
+
+    .card ul li {
+      margin-bottom: 0.5rem;
+      padding-left: 1.2rem;
+      position: relative;
+    }
+
+    .card ul li::before {
+      content: "•";
+      color: var(--accent);
+      position: absolute;
+      left: 0;
+      font-weight: bold;
+    }
+
+    /* Workflow visual diagram */
+    .flow-container {
+      display: flex;
+      align-items: stretch;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+
+    .flow-step {
+      flex: 1;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 0.85rem;
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .flow-step .step-num {
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--accent-light);
+      margin-bottom: 0.5rem;
+      text-transform: uppercase;
+    }
+
+    .flow-step h4 {
+      color: #fff;
+      font-size: 1.05rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .flow-step p {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+
+    .flow-arrow {
+      display: flex;
+      align-items: center;
+      color: var(--accent);
+      font-size: 1.5rem;
+      font-weight: bold;
+    }
+
+    /* Highlights & Tags */
+    .tag {
+      display: inline-block;
+      padding: 0.2rem 0.5rem;
+      border-radius: 0.35rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-right: 0.4rem;
+    }
+    .tag-blue { background: rgba(56, 189, 248, 0.15); color: var(--sky); border: 1px solid rgba(56, 189, 248, 0.3); }
+    .tag-green { background: rgba(16, 185, 129, 0.15); color: var(--emerald); border: 1px solid rgba(16, 185, 129, 0.3); }
+    .tag-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+    .tag-rose { background: rgba(244, 63, 94, 0.15); color: var(--rose); border: 1px solid rgba(244, 63, 94, 0.3); }
+
+    /* Footer & Navigation Controls */
+    footer {
+      height: 60px;
+      border-top: 1px solid var(--border);
+      background: #090d16;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 3rem;
+      z-index: 50;
+    }
+
+    .nav-hints {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    .nav-hints kbd {
+      background: #1e293b;
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid #334155;
+      font-family: monospace;
+      color: #fff;
+    }
+
+    .slide-counter {
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
+    .nav-buttons {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .nav-buttons button {
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #fff;
+      padding: 0.4rem 0.8rem;
+      border-radius: 0.5rem;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: background 0.2s;
+    }
+
+    .nav-buttons button:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    /* Print styles */
+    @media print {
+      body {
+        overflow: visible;
+        height: auto;
+      }
+      .slide {
+        position: relative;
+        opacity: 1 !important;
+        visibility: visible !important;
+        page-break-after: always;
+        height: 100vh;
+      }
+      footer {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <div id="presentation">
+
+    <!-- SLIDE 1 : Titre & Vision -->
+    <div class="slide active">
+      <div class="slide-badge">🦅 Solution de Pilotage Tout-en-un</div>
+      <h1>AIGLE</h1>
+      <p class="subtitle">
+        La rigueur prédictive de <strong>MS Project</strong>, l'agilité opérationnelle d'un <strong>Kanban</strong>, 
+        et un <strong>contrôle financier en temps réel</strong> au sein d'un binaire unique autonome.
+      </p>
+
+      <div class="grid-3" style="margin-top: 1rem;">
+        <div class="card">
+          <h3>⚡ Le Problème Classique</h3>
+          <p>
+            Outils dispersés : un fichier Gantt jamais à jour d'un côté, un Trello/Jira de l'autre, 
+            et un tableur Excel financier renseigné en fin de mois avec des approximations.
+          </p>
+        </div>
+        <div class="card" style="border-color: rgba(99, 102, 241, 0.4);">
+          <h3>🎯 La Solution Aigle</h3>
+          <p>
+            Une entité unique : chaque heure pointée et chaque ticket déplacé actualise immédiatement 
+            la date de fin du projet, le chemin critique et la marge financière restante.
+          </p>
+        </div>
+        <div class="card">
+          <h3>📦 Empreinte Zéro</h3>
+          <p>
+            Écrit en <strong>Go + Svelte 5</strong>. Un seul fichier exécutable autonome (15 Mo), 
+            base de données SQLite intégrée sans dépendance C, instantanément prêt pour le Cloud (PostgreSQL).
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 2 : Les 4 Piliers Fonctionnels -->
+    <div class="slide">
+      <div class="slide-badge">Périmètre Fonctionnel</div>
+      <h2>Ce que fait le logiciel : Les 4 piliers intégrés</h2>
+      <p class="subtitle">Tout ce dont une équipe a besoin pour planifier, exécuter et rentabiliser un projet.</p>
+
+      <div class="grid-4">
+        <div class="card">
+          <h3>📅 1. MS Project & CPM</h3>
+          <ul>
+            <li>Structure WBS (Phases, Lots, Jalons).</li>
+            <li>Liens Fin-à-Début (FS), SS, FF, SF.</li>
+            <li>Calcul automatique des dates (Forward / Backward pass).</li>
+            <li><strong>Chemin Critique</strong> tracé en rouge (marge = 0 jour).</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>📋 2. Tickets & Kanban</h3>
+          <ul>
+            <li>Workflow Kanban (Backlog, À faire, En cours, Revue, Fait).</li>
+            <li>Natures : Tâches, Bugs, Évolutions, Risques, Questions.</li>
+            <li><strong>Tickets enfants (Sous-tickets)</strong> avec héritage de planning.</li>
+            <li>Mode hybride : Épinglé au Gantt ou libre.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>💰 3. Moteur Financier EVM</h3>
+          <ul>
+            <li><strong>Budget Initial</strong> alloué par projet et par lot.</li>
+            <li><strong>Consommé réel</strong> (heures × taux horaire de l'assigné).</li>
+            <li><strong>Reste à faire (RAF)</strong> ajusté en direct.</li>
+            <li><strong>Atterrissage (EAC)</strong> et marge prévisionnelle.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>📚 4. Wiki & Documentation</h3>
+          <ul>
+            <li>Arborescence de pages en Markdown.</li>
+            <li>Liens interactifs avec les tickets (ex: <code>#AIG-12</code>).</li>
+            <li>Remontée directe du statut et du coût des tickets liés en bas de page.</li>
+            <li>Suivi des spécifications et des comptes-rendus.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 3 : Le Modèle Hybride Libre & Économie -->
+    <div class="slide">
+      <div class="slide-badge">Architecture Métier</div>
+      <h2>Comment tout s'articule : Le Modèle Hybride Libre</h2>
+      <p class="subtitle">La fin de la frontière artificielle entre "planning prévisionnel" et "tickets du quotidien".</p>
+
+      <div class="flow-container">
+        <div class="flow-step">
+          <div class="step-num">Niveau 1</div>
+          <h4>Projet & Budget</h4>
+          <p>Définit l'enveloppe budgétaire vendue (ex: 50 000 €), la date cible et l'équipe assignée avec son taux horaire (TJM).</p>
+        </div>
+
+        <div class="flow-arrow">→</div>
+
+        <div class="flow-step" style="border-color: rgba(99, 102, 241, 0.4);">
+          <div class="step-num">Niveau 2</div>
+          <h4>Planning WBS (Gantt)</h4>
+          <p>Structure macro : Phase Conception, Phase Dev, Recette. Les dépendances calculent automatiquement les dates de chaque lot.</p>
+        </div>
+
+        <div class="flow-arrow">→</div>
+
+        <div class="flow-step">
+          <div class="step-num">Niveau 3</div>
+          <h4>Tickets & Sous-Tickets</h4>
+          <p>Découpage opérationnel fin : un ticket peut être <strong>épinglé sur un lot</strong> du Gantt ou rester <strong>transverse</strong> au projet.</p>
+        </div>
+
+        <div class="flow-arrow">→</div>
+
+        <div class="flow-step" style="border-color: rgba(16, 185, 129, 0.4);">
+          <div class="step-num">Consolidation</div>
+          <h4>Atterrissage Temps Réel</h4>
+          <p>Pointage + Reste à faire = Atterrissage. Remonte dans le lot du Gantt et dans la marge globale du projet sans double comptage.</p>
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-top: 1.5rem;">
+        <div class="card" style="padding: 1rem 1.5rem;">
+          <h3 style="font-size: 1rem; color: var(--emerald);">🌿 Hiérarchie Parent / Sous-tickets</h3>
+          <p style="font-size: 0.9rem;">
+            Un ticket "Évolution Moteur" peut comporter 3 sous-tickets (Backend, Frontend, Tests). 
+            Le parent affiche en temps réel l'avancement (ex: <code>2/3 terminés</code>) et le coût consolidé.
+          </p>
+        </div>
+        <div class="card" style="padding: 1rem 1.5rem;">
+          <h3 style="font-size: 1rem; color: var(--sky);">⏱️ Pointage avec réajustement du RAF</h3>
+          <p style="font-size: 0.9rem;">
+            Pointer 4 heures propose immédiatement d'ajuster le <em>Reste à Faire (RAF)</em>. 
+            L'atterrissage financier s'ajuste immédiatement sans attendre une réunion d'avancement.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 4 : Cas Concret n°1 - Forfait Client -->
+    <div class="slide">
+      <div class="slide-badge">Cas d'usage n°1</div>
+      <h2>Le Projet au Forfait Client (Engagement de Marge)</h2>
+      <p class="subtitle">Comment livrer à temps tout en protégeant la marge brute de l'entreprise.</p>
+
+      <div class="grid-3">
+        <div class="card">
+          <div class="tag tag-blue">Étape 1</div>
+          <h3 style="margin-top: 0.5rem;">Cadrage & Budget</h3>
+          <p>
+            Vente d'une application à <strong>45 000 €</strong> avec livraison contractuelle au 18 décembre.
+            Chaque phase se voit allouer une enveloppe (ex: 8 500 € pour la conception, 24 000 € pour le dev).
+          </p>
+        </div>
+        <div class="card">
+          <div class="tag tag-purple">Étape 2</div>
+          <h3 style="margin-top: 0.5rem;">Ordonnancement Gantt</h3>
+          <p>
+            Les liens de dépendance (Fin-à-Début) entre phases sont créés. Le moteur CPM identifie la chaîne de tâches critiques 
+            qui détermine la date de mise en production.
+          </p>
+        </div>
+        <div class="card">
+          <div class="tag tag-rose">Étape 3</div>
+          <h3 style="margin-top: 0.5rem;">Gestion des Imprévus</h3>
+          <p>
+            Un développeur rencontre un blocage sur une API : il crée un ticket de bug, pointe 12h et réévalue le RAF à 8h.
+            Le ticket étant sur le chemin critique, le planning glisse de 2 jours en temps réel.
+          </p>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 1.5rem; background: rgba(99, 102, 241, 0.08); border-color: rgba(99, 102, 241, 0.3);">
+        <h3 style="color: var(--accent-light);">💡 Résultat pour le Chef de Projet</h3>
+        <p>
+          Pas besoin d'attendre le bilan financier de fin de mois : la jauge d'atterrissage affiche immédiatement 
+          un coût prévisionnel de <strong>46 200 € (+1 200 € de dérive)</strong>. Le chef de projet peut réajuster la charge 
+          sur un autre lot ou négocier un avenant immédiatement.
+        </p>
+      </div>
+    </div>
+
+    <!-- SLIDE 5 : Cas Concret n°2 - Équipe Produit Agile -->
+    <div class="slide">
+      <div class="slide-badge">Cas d'usage n°2</div>
+      <h2>Refonte Logicielle & Sprint en Équipe Agile</h2>
+      <p class="subtitle">Comment concilier les jalons de release avec l'autonomie quotidienne des développeurs.</p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>📌 Côté Planning (Product Owner)</h3>
+          <p style="margin-bottom: 0.75rem;">
+            Le PO positionne sur le diagramme de Gantt les grandes fonctionnalités cibles de la version 2.0 :
+          </p>
+          <ul>
+            <li><strong>Lot 1 :</strong> Authentification OAuth2 & Multi-tenant (10j)</li>
+            <li><strong>Lot 2 :</strong> Nouveau tableau de bord dynamique (15j)</li>
+            <li><strong>Jalon :</strong> Release Beta fermée (0j)</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3>⚡ Côté Kanban (Équipe de Dev)</h3>
+          <p style="margin-bottom: 0.75rem;">
+            L'équipe découpe le Lot 2 en tickets Kanban opérationnels :
+          </p>
+          <ul>
+            <li>Ticket Parent : <code>#AIG-15</code> Refonte Dashboard</li>
+            <li>↳ Sous-ticket A : Requêtes SQL d'agrégation (Dev Go)</li>
+            <li>↳ Sous-ticket B : Composant graphique Canvas/SVG (Dev Svelte)</li>
+            <li>↳ Sous-ticket C : Tests de charge 5 000 utilisateurs (QA)</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 1.5rem;">
+        <h3 style="color: var(--emerald);">🚀 Fluidité d'exécution</h3>
+        <p>
+          Les développeurs travaillent dans leur tableau Kanban classique (Drag & Drop, pointage rapide des heures). 
+          Automatiquement, la barre de la tâche sur le diagramme de Gantt passe de 25% à 75% d'avancement 
+          sans aucune réunion de reporting superflue.
+        </p>
+      </div>
+    </div>
+
+    <!-- SLIDE 6 : Cas Concret n°3 - Vue Direction Multi-Projets -->
+    <div class="slide">
+      <div class="slide-badge">Cas d'usage n°3</div>
+      <h2>Direction des Opérations : Portefeuille Multi-Projets</h2>
+      <p class="subtitle">Piloter 10 ou 50 projets simultanés en un coup d'œil.</p>
+
+      <div class="grid-3">
+        <div class="card">
+          <h3>📊 Synthèse Direction</h3>
+          <p>
+            Vision macro immédiate : total des budgets engagés, heures totales consommées, 
+            charge restante estimée (RAF) et marge prévisionnelle sur l'ensemble de l'entreprise.
+          </p>
+        </div>
+        <div class="card">
+          <h3>🚨 Alertes Préventives</h3>
+          <p>
+            Chaque projet possède un statut de santé (<strong>Healthy</strong>, <strong>Warning</strong>, <strong>Critical</strong>). 
+            Un projet qui dépasse de 5% son atterrissage est automatiquement signalé en rouge.
+          </p>
+        </div>
+        <div class="card">
+          <h3>🔍 Descente aux Détails</h3>
+          <p>
+            Un simple clic sur un projet en dérive ouvre son arborescence financière : on identifie en 5 secondes 
+            le ticket ou le lot précis qui a dérapé.
+          </p>
+        </div>
+      </div>
+
+      <div class="grid-2" style="margin-top: 1.5rem;">
+        <div class="card">
+          <h4 style="color: #fff; margin-bottom: 0.5rem;">Gestion des Profils & Taux Horaires</h4>
+          <p>
+            Chaque intervenant dispose de son taux horaire (ex: Architecte 95 €/h, Lead Dev 75 €/h, QA 65 €/h). 
+            La valorisation des tickets se fait à l'euro près selon la personne qui réalise le travail.
+          </p>
+        </div>
+        <div class="card">
+          <h4 style="color: #fff; margin-bottom: 0.5rem;">Dépenses Transverses & Achats</h4>
+          <p>
+            Aigle permet d'enregistrer des coûts fixes (licences logicielles, serveurs, sous-traitance) 
+            rattachés à un ticket spécifique ou globalement au projet.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SLIDE 7 : Déploiement & Architecture Technique -->
+    <div class="slide">
+      <div class="slide-badge">Technologie & Déploiement</div>
+      <h2>Architecture Hybride : Solo, Réseau Local ou SaaS</h2>
+      <p class="subtitle">La puissance d'une stack moderne (Go + Svelte 5) empaquetée dans un binaire sans contrainte.</p>
+
+      <div class="grid-2">
+        <div class="card">
+          <h3>💻 Mode Local (Binaire Autonome)</h3>
+          <ul>
+            <li>Un seul fichier exécutable : <strong><code>aigle.exe</code></strong> (15 Mo).</li>
+            <li>Base SQLite embarquée 100% Go (aucun driver C nécessaire).</li>
+            <li>Interface web Svelte 5 pré-compilée et intégrée dans le binaire.</li>
+            <li>Double-cliquez : l'application démarre et ouvre le navigateur.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>☁️ Mode SaaS / Équipe</h3>
+          <ul>
+            <li>Le même binaire peut être branché sur un serveur <strong>PostgreSQL</strong>.</li>
+            <li>Synchronisation en temps réel multi-utilisateurs via <strong>Server-Sent Events (SSE)</strong>.</li>
+            <li>Quand un collaborateur déplace une carte ou pointe des heures, l'écran de toute l'équipe s'actualise.</li>
+            <li>Consommation mémoire minime (&lt; 25 Mo de RAM).</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 1.5rem; text-align: center; border-color: rgba(16, 185, 129, 0.4);">
+        <h3 style="color: var(--emerald); justify-content: center;">🎉 Prêt à l'Emploi</h3>
+        <p style="max-width: 700px; margin: 0 auto;">
+          Lancez <code>run.cmd</code> ou <code>.\aigle.exe -open</code> à la racine du projet pour ouvrir 
+          immédiatement l'application avec un jeu de démonstration complet.
+        </p>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Footer Navigation -->
+  <footer>
+    <div class="nav-hints">
+      Navigation : Utilisez les touches <kbd>←</kbd> <kbd>→</kbd> ou <kbd>Espace</kbd> • Plein écran : <kbd>F11</kbd>
+    </div>
+    <div class="slide-counter" id="counter">1 / 7</div>
+    <div class="nav-buttons">
+      <button onclick="prevSlide()">◀ Précédent</button>
+      <button onclick="nextSlide()">Suivant ▶</button>
+    </div>
+  </footer>
+
+  <script>
+    let currentSlide = 0;
+    const slides = document.querySelectorAll('.slide');
+    const counter = document.getElementById('counter');
+
+    function updateSlide(index) {
+      if (index < 0 || index >= slides.length) return;
+      slides[currentSlide].classList.remove('active');
+      currentSlide = index;
+      slides[currentSlide].classList.add('active');
+      counter.textContent = `${currentSlide + 1} / ${slides.length}`;
+    }
+
+    function nextSlide() {
+      if (currentSlide < slides.length - 1) {
+        updateSlide(currentSlide + 1);
+      }
+    }
+
+    function prevSlide() {
+      if (currentSlide > 0) {
+        updateSlide(currentSlide - 1);
+      }
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') {
+        nextSlide();
+      } else if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        prevSlide();
+      } else if (e.key === 'Home') {
+        updateSlide(0);
+      } else if (e.key === 'End') {
+        updateSlide(slides.length - 1);
+      }
+    });
+  </script>
+</body>
+</html>
+

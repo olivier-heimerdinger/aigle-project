@@ -1,0 +1,46 @@
+# ==============================================================================
+# BASE D'UTILISATEURS AUTHELIA — AIGLE SAAS (EXEMPLE)
+# Copiez vers server/authelia/users_database.yml
+# Pour générer un hash Argon2id :
+#   docker run --rm authelia/authelia:latest authelia crypto hash generate argon2 --password 'VotreMotDePasse'
+# ==============================================================================
+
+users:
+  # Compte SuperAdmin (accès à tous les Workspaces + Console d'Administration SaaS)
+  admin:
+    disabled: false
+    displayname: "Administrateur Heimerdinger Studio"
+    email: "admin@heimerdinger.studio"
+    # Hash Argon2id d'exemple (mot de passe par défaut : AigleAdmin2026!)
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c2FsdGV4YW1wbGUxMjM0NTY$e4d6c7a8b9f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e"
+    groups:
+      - admins
+      - superadmin
+
+  # Compte Chef de Projet (peut créer/gérer les projets, budgets, Gantt et tickets)
+  chefprojet:
+    disabled: false
+    displayname: "Sophie Martin (Directrice de Projet)"
+    email: "sophie.martin@heimerdinger.studio"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c2FsdGV4YW1wbGUxMjM0NTY$e4d6c7a8b9f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e"
+    groups:
+      - managers
+
+  # Compte Collaborateur (peut gérer les tickets, sous-tickets, pointages et wiki)
+  developpeur:
+    disabled: false
+    displayname: "Thomas Bernard (Lead Tech)"
+    email: "thomas.bernard@heimerdinger.studio"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c2FsdGV4YW1wbGUxMjM0NTY$e4d6c7a8b9f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e"
+    groups:
+      - developers
+
+  # Compte Client Externe (Lecture seule stricte)
+  client:
+    disabled: false
+    displayname: "Client Observateur"
+    email: "contact@client-externe.fr"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$c2FsdGV4YW1wbGUxMjM0NTY$e4d6c7a8b9f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e"
+    groups:
+      - viewers
+
